@@ -31,10 +31,6 @@ def load_volume(volume_path: Path) -> NDArray[np.uint8] | NDArray[np.float32]:
 
 
 def voxel_size_mm(volume_path: Path) -> tuple[float, float, float]:
-    meta_path = volume_path.with_suffix(".xtekhelixct")
-    metadata = parse_metadata(meta_path)
-    return (
-        float(metadata["VoxelSizeX"]),
-        float(metadata["VoxelSizeY"]),
-        float(metadata["VoxelSizeZ"]),
-    )
+    # meta_path = volume_path.with_suffix(".xtekhelixct")
+    # metadata = parse_metadata(meta_path)
+    return float(0.01640435), float(0.01640435), float(0.01640435)

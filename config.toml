@@ -1,0 +1,16 @@
+[paths]
+vol_data = "../Data/M50L-06.raw"
+
+[vol_info]
+voxel_size = 0.01640435
+
+[analysis]
+slab_thickness = 11
+baseline_method = "median"
+vol_top = 200
+vol_bottom = 4060
+dead_zone_scale = 3.0 # resisual dead zone scale in units of sigma
+
+[noise]
+clip_scale = 2.5
+slice_step = 500
