@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import math
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Sequence
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 from metal import extract_metal_mask
+from utils import identify_cylindrical_support
 
 # ----------------------------------------------------------------------------
 # Noise estimation from EM-maximization fit to a 2-component mixture distribution
@@ -152,12 +153,15 @@ def fit_mixture_distribution(
 # sigma_R/sigma = 1 - f(rho1,rho2)/N - g(rho1,rho2)/N^2
 # Fit to Monte Carlo over a pentadiagonal (lag-1, lag-2) Gaussian covariance,
 # odd N in [5, 61], rho1 in [0.30, 0.60], rho2 in [0.08, 0.12].
+
 _F_COEF = (0.48417, -0.04204, 0.16959, -0.14318, 3.06188)  # const, r1, r1^2, r2, r1*r2
+_F_COEF = (0.50373, 0.00559, 0.11647, -0.00362, 1.98957)  # const, r1, r1^2, r2, r1*r2
 _G_COEF = (-1.06974, 8.88342, 5.72699)  # const, r1, r2
+_G_COEF = (-1.45079, 9.46226, 7.31325)  # const, r1, r2
 
 _N_MIN, _N_MAX = 5, 61
-_RHO1_MIN, _RHO1_MAX = 0.30, 0.60
-_RHO2_MIN, _RHO2_MAX = 0.08, 0.12
+_RHO1_MIN, _RHO1_MAX = 0.30, 0.70
+_RHO2_MIN, _RHO2_MAX = 0.08, 0.18
 
 
 def _pentadiagonal_min_eig(n: int, rho1: float, rho2: float) -> float:
@@ -218,18 +222,32 @@ def leavein_median_noise_scale_penta(
     float
         sigma_R / sigma (std ratio), in (0, 1].
     """
-    if not (_N_MIN <= n <= _N_MAX):
-        raise ValueError(f"n={n} outside fitted range [{_N_MIN}, {_N_MAX}]")
-    if n % 2 == 0:
-        raise ValueError(f"n={n} must be odd (window centered on a slice)")
-    if not (_RHO1_MIN <= rho1 <= _RHO1_MAX):
-        raise ValueError(f"rho1={rho1} outside fitted range [{_RHO1_MIN}, {_RHO1_MAX}]")
-    if not (_RHO2_MIN <= rho2 <= _RHO2_MAX):
-        raise ValueError(f"rho2={rho2} outside fitted range [{_RHO2_MIN}, {_RHO2_MAX}]")
-    if check_pd and _pentadiagonal_min_eig(n, rho1, rho2) <= 1e-9:
-        raise ValueError(
-            f"(rho1={rho1}, rho2={rho2}) is not positive-definite at n={n}; "
-            f"this correlation pair is unphysical (lag-2 too small for this lag-1)"
+    try:
+        if not (_N_MIN <= n <= _N_MAX):
+            raise ValueError(f"n={n} outside fitted range [{_N_MIN}, {_N_MAX}]")
+        if n % 2 == 0:
+            raise ValueError(f"n={n} must be odd (window centered on a slice)")
+        if not (_RHO1_MIN <= rho1 <= _RHO1_MAX):
+            _orig = rho1
+            rho1 = float(np.clip(rho1, _RHO1_MIN, _RHO1_MAX))
+            raise ValueError(
+                f"rho1={_orig} outside fitted range [{_RHO1_MIN}, {_RHO1_MAX}]"
+            )
+
+        if not (_RHO2_MIN <= rho2 <= _RHO2_MAX):
+            _orig = rho2
+            rho2 = float(np.clip(rho2, _RHO2_MIN, _RHO2_MAX))
+            raise ValueError(
+                f"rho2={_orig} outside fitted range [{_RHO2_MIN}, {_RHO2_MAX}]"
+            )
+        if check_pd and _pentadiagonal_min_eig(n, rho1, rho2) <= 1e-9:
+            raise ValueError(
+                f"(rho1={rho1}, rho2={rho2}) is not positive-definite at n={n}; "
+                f"this correlation pair is unphysical (lag-2 too small for this lag-1)"
+            )
+    except ValueError as e:
+        print(
+            f"Invalid parameters: {e}. Clipped values will be used for the calculation, but the result may be inaccurate."
         )
 
     f0, f1, f2, f3, f4 = _F_COEF
@@ -246,7 +264,7 @@ def leavein_median_noise_scale_penta(
 
 def estimate_slice_stats(
     block: NDArray[np.uint8],
-    mask: NDArray[np.bool_] | None = None,
+    valid_mask: NDArray[np.bool_] | None = None,
     trunc_k: float = 2.0,
 ) -> dict[str, object]:
     """Estimate per-voxel noise and inter-slice correlation from a 5-slice window.
@@ -278,8 +296,8 @@ def estimate_slice_stats(
     ----------
     block : NDArray[np.uint8], shape (5, H, W)
         Five consecutive transaxial slices (the window for one z location).
-    mask : NDArray[np.bool_], shape (H, W), optional
-        Metal mask: True = ignore (retained via ~mask). None = use all voxels.
+    valid_mask : NDArray[np.bool_], shape (H, W), optional
+        Boolean mask where True indicates a valid voxel to use. None = use all voxels.
     trunc_k : float
         Truncated-core window (in sigma) for the mixture fit of sigma_diff.
 
@@ -310,12 +328,12 @@ def estimate_slice_stats(
     da = s[0] - 2 * s[1] + s[2]
     db = s[2] - 2 * s[3] + s[4]
 
-    if mask is not None:
-        if mask.shape != block.shape[1:]:
+    if valid_mask is not None:
+        if valid_mask.shape != block.shape[1:]:
             raise ValueError(
-                f"mask shape {mask.shape} does not match slice shape {block.shape[1:]}"
+                f"valid_mask shape {valid_mask.shape} does not match slice shape {block.shape[1:]}"
             )
-        valid = ~mask
+        valid = valid_mask
     else:
         valid = np.ones(block.shape[1:], dtype=bool)
 
@@ -393,13 +411,20 @@ def _estimate_volume_slice_stat(
 ) -> tuple[int, dict[str, object]]:
     block = volume[slice_level - 2 : slice_level + 3, :, :]
     if metal_threshold is not None:
-        metal_mask = extract_metal_mask(
-            block.max(axis=0), metal_threshold, min_area=200, margin=10
+        metal_mask = cast(
+            NDArray,
+            extract_metal_mask(
+                block.max(axis=0), metal_threshold, min_area=200, margin=10
+            ),
         )
+        support_mask = identify_cylindrical_support(metal_mask)
+        valid_mask = ~metal_mask & support_mask
     else:
-        metal_mask = None
+        valid_mask = None
 
-    return slice_level, estimate_slice_stats(block, mask=metal_mask, trunc_k=trunc_k)
+    return slice_level, estimate_slice_stats(
+        block, valid_mask=valid_mask, trunc_k=trunc_k
+    )
 
 
 def estimate_volume_slice_stats(
@@ -486,12 +511,16 @@ def estimate_volume_slice_stats(
         float(np.median(sigma_diff_vals)) if sigma_diff_vals else float("nan")
     )
 
-    rho1_vals: list[float] = [v["rho1"] for v in slice_stats.values() if v["valid"]]
+    rho1_vals: list[float] = [
+        float(v["rho1"]) for v in slice_stats.values() if v["valid"]
+    ]
     results["rho1_min"] = float(np.min(rho1_vals)) if rho1_vals else float("nan")
     results["rho1_max"] = float(np.max(rho1_vals)) if rho1_vals else float("nan")
     results["rho1_median"] = float(np.median(rho1_vals)) if rho1_vals else float("nan")
 
-    rho2_vals: list[float] = [v["rho2"] for v in slice_stats.values() if v["valid"]]
+    rho2_vals: list[float] = [
+        float(v["rho2"]) for v in slice_stats.values() if v["valid"]
+    ]
     results["rho2_min"] = float(np.min(rho2_vals)) if rho2_vals else float("nan")
     results["rho2_max"] = float(np.max(rho2_vals)) if rho2_vals else float("nan")
     results["rho2_median"] = float(np.median(rho2_vals)) if rho2_vals else float("nan")

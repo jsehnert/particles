@@ -1,16 +1,152 @@
 [paths]
-vol_data = "../Data/M50L-06.raw"
+vol_data_path = "/Users/jim/Documents/GitHub/particles/Data/M50L-21.raw"
 
 [vol_info]
 voxel_size = 0.01640435
 
 [analysis]
 slab_thickness = 11
-baseline_method = "median"
+baseline_method = "median" #Baseline estimate method 'median' or 'mean'
 vol_top = 200
 vol_bottom = 4060
-dead_zone_scale = 3.0 # resisual dead zone scale in units of sigma
+
+# Slice-by-slice analysis parameters
+dead_zone_scale = 4.0 # resisual dead zone scale in units of sigma
+area_threshold = 2 # Minimum area for connected components in the particle slice mask
+
+# Full volume analysis parameters
+slices_per_chunk = 256 # Number of slices to process in one chunk
+z_extent_max = 16 # Longest admissible axial extent of a candidate in slices
+vol_threshold = 3 # minimu volume for connected components in the particle volume mask
+high_threshold_scale = 4.2 # High threshold for candidate dections (scales sigma)
+low_threshold_scale = 3.0 # Low threshold for candidate growth (scales sigma)
+aniso_factor = 1.2 # Controls the z_extent relative to the lateral extent for a particle. Values < 1.0 are more restrictive, values > 1.0 are more permissive. A value of 1.0 is a good starting point for most cases. Regardless, clipping is applied to the z_extent_max to prevent unreasonably long candidates from being accepted. The default of 1.0 is a good starting point for most cases.
+small_vol_cutoff = 5 # Minimum number of voxels for valid candidates with small z_extent
+z_pad = 2 # Additional slop factor for the z_extent test to prevent integer roundoff from clipping borderline mid-size blobs.
+small_z_bounds = [1, 4] # Inclusive z_extent bounds for small components
 
 [noise]
-clip_scale = 2.5
-slice_step = 500
+clip_scale = 2.5 #Clipping performed when estimating the gaussian noise
+slice_step = 50 #Step size for sampling slices when estimating noise statistics across the volume
+
+[metal]
+gray_margin = 20 #Grayscale margin allowed to grow into
+min_area = 200   #Minimum area of metal mask components
+
+[grayscale_landmarks]
+slice_step = 200 #Step size for sampling slices when estimating grayscale landmarks across the volume
+
+[[cell]]
+name = "M50L-01"
+z_min = 205
+z_max = 4067
+
+[[cell]]
+name = "M50L-02"
+z_min = 202
+z_max = 4063
+
+[[cell]]
+name = "M50L-03"
+z_min = 200
+z_max = 4065
+
+[[cell]]
+name = "M50L-04"
+z_min = 207
+z_max = 4064
+
+[[cell]]
+name = "M50L-05"
+z_min = 204
+z_max = 4060
+
+[[cell]]
+name = "M50L-06"
+z_min = 200
+z_max = 4066
+
+[[cell]]
+name = "M50L-07"
+z_min = 195
+z_max = 4060
+
+[[cell]]
+name = "M50L-08"
+z_min = 210
+z_max = 4071
+
+[[cell]]
+name = "M50L-09"
+z_min = 212
+z_max = 4073
+
+[[cell]]
+name = "M50L-10"
+z_min = 213
+z_max = 4077
+
+[[cell]]
+name = "M50L-11"
+z_min = 207
+z_max = 4067
+
+[[cell]]
+name = "M50L-12"
+z_min = 206
+z_max = 4071
+
+[[cell]]
+name = "M50L-13"
+z_min = 223
+z_max = 4084
+
+[[cell]]
+name = "M50L-14"
+z_min = 206
+z_max = 4073
+
+[[cell]]
+name = "M50L-15"
+z_min = 231
+z_max = 4083
+
+[[cell]]
+name = "M50L-16"
+z_min = 240
+z_max = 4089
+
+[[cell]]
+name = "M50L-17"
+z_min = 238
+z_max = 4076
+
+[[cell]]
+name = "M50L-18"
+z_min = 243
+z_max = 4075
+
+[[cell]]
+name = "M50L-19"
+z_min = 238
+z_max = 4092
+
+[[cell]]
+name = "M50L-20"
+z_min = 243
+z_max = 4075
+
+[[cell]]
+name = "M50L-21"
+z_min = 246
+z_max = 4084
+
+[[cell]]
+name = "M50L-22"
+z_min = 245
+z_max = 4084
+
+[[cell]]
+name = "M50L-23"
+z_min = 246
+z_max = 4085

@@ -56,8 +56,8 @@ def estimate_metal_threshold(
 
 
 def extract_metal_mask(
-    img: np.ndarray, metal_threshold: int, min_area: int, margin: int = 0
-) -> np.ndarray[np.bool_]:
+    img: NDArray[np.uint8], metal_threshold: int, min_area: int, margin: int = 0
+) -> NDArray[np.bool_]:
     """
     Extract a binary mask of the metal regions from the given image using the specified metal threshold.
 
@@ -73,6 +73,9 @@ def extract_metal_mask(
     """
     # High-threshold seeds
     seeds = (img > metal_threshold).astype(np.uint8)
+    '''print(
+        f"    ****DEBUG: seeds type: {type(seeds)}, shape: {seeds.shape}, dtype: {seeds.dtype}"
+    )'''
     n, labels, stats, _ = cv2.connectedComponentsWithStats(seeds, connectivity=8)
     valid_seeds = set(
         int(i + 1) for i in np.where(stats[1:, cv2.CC_STAT_AREA] >= min_area)[0]
