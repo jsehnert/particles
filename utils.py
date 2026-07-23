@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+from numba import njit, prange
 from numpy.typing import NDArray
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks
@@ -105,3 +106,383 @@ def identify_cylindrical_support(metal_mask: NDArray[np.bool_]) -> NDArray[np.bo
     inside_mask = np.zeros_like(metal_mask, dtype=np.uint8)
     cv2.drawContours(inside_mask, [outer_contour], -1, 255, thickness=cv2.FILLED)
     return inside_mask.astype(bool)
+
+
+#######
+FloatArray = NDArray[np.float32]
+
+
+class UF:
+    """Index partitioning into disjoint sets using union-find (UF) data structure.
+    Each element initially belongs to its own set. The `find` method returns the
+    representative of the set containing a given element, and the `union` method
+    merges the sets containing two given elements.
+    """
+
+    def __init__(self, k):
+        self.p = list(range(k))
+
+    def find(self, x):
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[ra] = rb
+
+
+@njit(cache=True, parallel=True, fastmath=False)
+def _median_baseline_core(
+    vol: NDArray[np.uint8],
+    z0: int,
+    z1: int,
+    w: int,
+    out: FloatArray,
+) -> None:
+    """Leave-in median baseline for output slices [z0, z1), 1D median filter of
+    width ``w`` down axis 0, with fixed-width clamp-and-shift window edges.
+
+    For each output slice n the window is [start, start+w) with
+    start = clamp(n - w//2, 0, Z-w) — exactly the window your _compute_residual
+    builds. A per-column 256-bin histogram is slid down z (one slice out, one in
+    per step) and the median is tracked with a moving pointer, so cost per output
+    voxel is O(1), independent of w.
+
+    Median convention matches numpy: for odd w the middle value; for even w the
+    mean of the two middle values. uint8 makes the histogram exact (256 bins), so
+    the result is bit-identical to np.median(...).astype(float32).
+    """
+    Z = vol.shape[0]
+    H = vol.shape[1]
+    W = vol.shape[2]
+    half = w // 2
+    k = half  # 0-indexed order statistic tracked by the pointer (odd-window median)
+    zmw = Z - w  # maximum legal window start
+
+    for yy in prange(H):
+        hist = np.zeros((W, 256), dtype=np.int32)
+        m = np.zeros(W, dtype=np.int64)  # per-column median bin (pointer)
+        lt = np.zeros(W, dtype=np.int64)  # per-column count of elements < m
+
+        prev_start = -1
+        for n in range(z0, z1):
+            start = n - half
+            if start < 0:
+                start = 0
+            elif start > zmw:
+                start = zmw
+
+            if prev_start == -1:
+                # first output of this row: build the window histogram from scratch
+                for s in range(start, start + w):
+                    row = vol[s, yy]
+                    for xx in range(W):
+                        hist[xx, row[xx]] += 1
+                # initialise each column's pointer to the k-th order statistic
+                for xx in range(W):
+                    c = 0
+                    mm = 0
+                    while c + hist[xx, mm] <= k:
+                        c += hist[xx, mm]
+                        mm += 1
+                    m[xx] = mm
+                    lt[xx] = c
+                prev_start = start
+            elif start != prev_start:
+                # window advanced by one: drop slice prev_start, add slice prev_start+w
+                row_out = vol[prev_start, yy]
+                row_in = vol[prev_start + w, yy]
+                for xx in range(W):
+                    vo = row_out[xx]
+                    vi = row_in[xx]
+                    if vo != vi:
+                        hist[xx, vo] -= 1
+                        hist[xx, vi] += 1
+                        mm = m[xx]
+                        c = lt[xx]
+                        if vo < mm:
+                            c -= 1
+                        if vi < mm:
+                            c += 1
+                        # restore invariant: lt <= k < lt + hist[m]
+                        if c > k:
+                            while c > k:
+                                mm -= 1
+                                c -= hist[xx, mm]
+                        else:
+                            while c + hist[xx, mm] <= k:
+                                c += hist[xx, mm]
+                                mm += 1
+                        m[xx] = mm
+                        lt[xx] = c
+                prev_start = start
+            # else: window unchanged (boundary run) → pointers already correct
+
+            oi = n - z0
+            # window is enforced odd, so the median is exactly m[xx] (an integer
+            # bin in [0,255]). Writing it works for a float32 or a uint8 out array
+            # alike — Numba specializes the store on out's dtype. uint8 is lossless.
+            for xx in range(W):
+                out[oi, yy, xx] = m[xx]
+
+
+def median_baseline_block(
+    vol: NDArray[np.uint8],
+    z0: int,
+    z1: int,
+    window_size: int,
+    out_dtype: type = np.uint8,
+) -> NDArray:
+    """Leave-in median baseline for output slices [z0, z1), shape (z1-z0, H, W).
+
+    Computed for a whole slice-run at once so the sliding histogram is reused
+    across slices (drop-in for the ``np.median`` step in ``_compute_residual``).
+    ``vol`` must be C-contiguous uint8 with Z >= window_size, and window_size odd.
+
+    out_dtype:
+        np.uint8 — (default) LOSSLESS here: an odd-window median of uint8 values is itself a
+            uint8 value, so no rounding. 4x smaller on disk/RAM (~9.3 GB vs ~37 GB
+            for the full volume). See the subtraction caveat below.
+
+    Caveat when out_dtype=np.uint8: do NOT compute the residual as uint8 minus
+    uint8 — that wraps around (10 - 20 -> 246). Cast first, e.g.
+        residual = vol[n].astype(np.int16) - baseline[n].astype(np.int16)
+    which is exact and signed (residual range [-255, 255], fits int16), consistent
+    with passing negative residuals pre-clip into detection.
+    """
+    if vol.dtype != np.uint8:
+        raise TypeError("median_baseline_block requires a uint8 volume")
+    if window_size % 2 == 0:
+        raise ValueError(
+            f"window_size must be odd for a centered median; got {window_size}. "
+            "(An even window has no single center; a symmetric [n-w//2, n+w//2+1) "
+            "span is w+1 wide, not w.)"
+        )
+    dt = np.dtype(out_dtype)
+    if dt not in (np.dtype(np.float32), np.dtype(np.uint8)):
+        raise ValueError(f"out_dtype must be float32 or uint8, got {dt}")
+    Z, H, W = vol.shape
+    if Z < window_size:
+        raise ValueError(f"Z={Z} < window_size={window_size}")
+    vol = np.ascontiguousarray(vol)
+    out = np.empty((z1 - z0, H, W), dtype=dt)
+    _median_baseline_core(vol, z0, z1, window_size, out)
+    return out
+
+
+@njit(cache=True, parallel=True, fastmath=False)
+def _median_max_core(
+    vol: NDArray[np.uint8],
+    z0: int,
+    z1: int,
+    w: int,
+    med_out,
+    max_out,
+) -> None:
+    """Fused leave-in median + windowed max for output slices [z0, z1).
+
+    Same sliding 256-bin per-column histogram as the median kernel; the max is the
+    highest non-empty bin, tracked with one extra per-column pointer. Both use the
+    identical clamp-and-shift window, so this is exactly the (baseline, metal-mask
+    source) pair _compute_residual needs — computed in ONE pass over the volume
+    instead of two. Window must be odd; uint8 makes both exact.
+    """
+    Z = vol.shape[0]
+    H = vol.shape[1]
+    W = vol.shape[2]
+    half = w // 2
+    k = half
+    zmw = Z - w
+
+    for yy in prange(H):
+        hist = np.zeros((W, 256), dtype=np.int32)
+        m = np.zeros(W, dtype=np.int64)  # median bin
+        lt = np.zeros(W, dtype=np.int64)  # count < m
+        hi = np.zeros(W, dtype=np.int64)  # highest non-empty bin (window max)
+
+        prev_start = -1
+        for n in range(z0, z1):
+            start = n - half
+            if start < 0:
+                start = 0
+            elif start > zmw:
+                start = zmw
+
+            if prev_start == -1:
+                for s in range(start, start + w):
+                    row = vol[s, yy]
+                    for xx in range(W):
+                        hist[xx, row[xx]] += 1
+                for xx in range(W):
+                    c = 0
+                    mm = 0
+                    while c + hist[xx, mm] <= k:
+                        c += hist[xx, mm]
+                        mm += 1
+                    m[xx] = mm
+                    lt[xx] = c
+                    b = 255
+                    while hist[xx, b] == 0:
+                        b -= 1
+                    hi[xx] = b
+                prev_start = start
+            elif start != prev_start:
+                row_out = vol[prev_start, yy]
+                row_in = vol[prev_start + w, yy]
+                for xx in range(W):
+                    vo = row_out[xx]
+                    vi = row_in[xx]
+                    if vo != vi:
+                        hist[xx, vo] -= 1
+                        hist[xx, vi] += 1
+                        # median pointer
+                        mm = m[xx]
+                        c = lt[xx]
+                        if vo < mm:
+                            c -= 1
+                        if vi < mm:
+                            c += 1
+                        if c > k:
+                            while c > k:
+                                mm -= 1
+                                c -= hist[xx, mm]
+                        else:
+                            while c + hist[xx, mm] <= k:
+                                c += hist[xx, mm]
+                                mm += 1
+                        m[xx] = mm
+                        lt[xx] = c
+                        # max pointer
+                        h = hi[xx]
+                        if vi > h:
+                            h = vi
+                        if hist[xx, h] == 0:  # only if we emptied the top bin
+                            while h > 0 and hist[xx, h] == 0:
+                                h -= 1
+                        hi[xx] = h
+                prev_start = start
+
+            oi = n - z0
+            for xx in range(W):
+                med_out[oi, yy, xx] = m[xx]
+                max_out[oi, yy, xx] = hi[xx]
+
+
+def median_max_baseline_block(
+    vol: NDArray[np.uint8],
+    z0: int,
+    z1: int,
+    window_size: int,
+    med_dtype: type = np.uint8,
+    max_dtype: type = np.uint8,
+):
+    """Fused (median baseline, windowed max) for output slices [z0, z1).
+
+    Returns (median, maximum), each shape (z1-z0, H, W). Both over the identical
+    odd, clamp-and-shift centered window, computed in a single sliding-histogram
+    pass — the max is the top non-empty bin of the same histogram used for the
+    median, so it costs almost nothing beyond the median alone and avoids a second
+    read of the volume. Both are exact for uint8 input (median lossless for odd w;
+    max of uint8 is uint8).
+    """
+    if vol.dtype != np.uint8:
+        raise TypeError("median_max_baseline_block requires a uint8 volume")
+    if window_size % 2 == 0:
+        raise ValueError(f"window_size must be odd; got {window_size}")
+    Z, H, W = vol.shape
+    if Z < window_size:
+        raise ValueError(f"Z={Z} < window_size={window_size}")
+    vol = np.ascontiguousarray(vol)
+    med = np.empty((z1 - z0, H, W), dtype=np.dtype(med_dtype))
+    mx = np.empty((z1 - z0, H, W), dtype=np.dtype(max_dtype))
+    _median_max_core(vol, z0, z1, window_size, med, mx)
+    return med, mx
+
+
+@njit(cache=True, parallel=True, fastmath=False)
+def _max_filter_core(
+    vol: NDArray[np.uint8],
+    z0: int,
+    z1: int,
+    w: int,
+    out,
+) -> None:
+    """Windowed max down axis 0 for output slices [z0, z1), same clamp-and-shift
+    window as the median kernel. Per-column 256-bin histogram slid down z; the max
+    is the highest non-empty bin, updated in O(1) amortized. Reads each slice ~twice
+    (one in, one out) instead of the ~w times a per-slice np.max window costs."""
+    Z = vol.shape[0]
+    H = vol.shape[1]
+    W = vol.shape[2]
+    half = w // 2
+    zmw = Z - w
+    for yy in prange(H):
+        hist = np.zeros((W, 256), dtype=np.int32)
+        hi = np.zeros(W, dtype=np.int64)
+        prev_start = -1
+        for n in range(z0, z1):
+            start = n - half
+            if start < 0:
+                start = 0
+            elif start > zmw:
+                start = zmw
+            if prev_start == -1:
+                for s in range(start, start + w):
+                    row = vol[s, yy]
+                    for xx in range(W):
+                        hist[xx, row[xx]] += 1
+                for xx in range(W):
+                    b = 255
+                    while hist[xx, b] == 0:
+                        b -= 1
+                    hi[xx] = b
+                prev_start = start
+            elif start != prev_start:
+                row_out = vol[prev_start, yy]
+                row_in = vol[prev_start + w, yy]
+                for xx in range(W):
+                    vo = row_out[xx]
+                    vi = row_in[xx]
+                    if vo != vi:
+                        hist[xx, vo] -= 1
+                        hist[xx, vi] += 1
+                        h = hi[xx]
+                        if vi > h:
+                            h = vi
+                        if hist[xx, h] == 0:
+                            while h > 0 and hist[xx, h] == 0:
+                                h -= 1
+                        hi[xx] = h
+                prev_start = start
+            oi = n - z0
+            for xx in range(W):
+                out[oi, yy, xx] = hi[xx]
+
+
+def max_filter_block(
+    vol: NDArray[np.uint8],
+    z0: int,
+    z1: int,
+    window_size: int,
+    out_dtype: type = np.uint8,
+):
+    """Windowed max down z for output slices [z0, z1), shape (z1-z0, H, W).
+
+    Single sliding pass (each input slice read ~twice) rather than the ~window_size
+    re-reads a per-slice np.max window incurs; parallel over rows. Same clamp-and-shift
+    centered window as median_baseline_block, so the metal-mask max lines up with the
+    baseline when both use the same window_size. uint8 in/out is exact (max of uint8
+    is uint8). Valid for any window_size >= 1 (max is well-defined for even windows).
+    """
+    if vol.dtype != np.uint8:
+        raise TypeError("max_filter_block requires a uint8 volume")
+    Z, H, W = vol.shape
+    if Z < window_size:
+        raise ValueError(f"Z={Z} < window_size={window_size}")
+    vol = np.ascontiguousarray(vol)
+    out = np.empty((z1 - z0, H, W), dtype=np.dtype(out_dtype))
+    _max_filter_core(vol, z0, z1, window_size, out)
+    return out

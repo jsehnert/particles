@@ -55,7 +55,47 @@ def estimate_metal_threshold(
     return metal_threshold
 
 
-def extract_metal_mask(
+def extract_metal_mask(img: NDArray[np.uint8],
+                       metal_threshold: int,
+                       min_area: int,
+                       margin: int = 0) -> NDArray[np.bool_]:
+    """
+    Extract a binary mask of the metal regions from the given image using the specified metal threshold.
+
+    Args:
+        img: A 2D numpy array representing a single slice of the volume.
+        metal_threshold: An integer representing the gray value threshold for identifying metal regions.
+        min_area: An integer representing the minimum area of a metal region to be considered valid.
+        margin: If > 0, apply hysteresis: seed regions from pixels above metal_threshold, then
+            expand each seed region to include connected neighbouring pixels above
+            (metal_threshold - margin). This is analogous to Canny's two-threshold approach.
+    Returns:
+        A binary numpy array of the same shape as img, where True values indicate metal regions and False values indicate non-metal regions.
+    """
+    seeds = (img > metal_threshold).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStatsWithAlgorithm(
+        seeds, 8, cv2.CV_32S, cv2.CCL_BBDT
+    )
+    keep = np.zeros(n, dtype=bool)
+    if n > 1:
+        keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_area
+    if margin <= 0 or not keep.any():
+        return keep[labels]
+    low = (img > metal_threshold - margin).astype(np.uint8)
+    n_low, low_labels = cv2.connectedComponentsWithAlgorithm(
+        low, 8, cv2.CV_32S, cv2.CCL_BBDT
+    )
+    ys, xs = np.nonzero(seeds)
+    lab = labels[ys, xs]
+    lo = low_labels[ys, xs]
+    ok = keep[lab]
+    seeded = np.zeros(n_low, dtype=bool)
+    seeded[lo[ok]] = True
+    seeded[0] = False
+    return seeded[low_labels]
+
+
+def extract_metal_mask_(
     img: NDArray[np.uint8], metal_threshold: int, min_area: int, margin: int = 0
 ) -> NDArray[np.bool_]:
     """
@@ -73,9 +113,9 @@ def extract_metal_mask(
     """
     # High-threshold seeds
     seeds = (img > metal_threshold).astype(np.uint8)
-    '''print(
+    """print(
         f"    ****DEBUG: seeds type: {type(seeds)}, shape: {seeds.shape}, dtype: {seeds.dtype}"
-    )'''
+    )"""
     n, labels, stats, _ = cv2.connectedComponentsWithStats(seeds, connectivity=8)
     valid_seeds = set(
         int(i + 1) for i in np.where(stats[1:, cv2.CC_STAT_AREA] >= min_area)[0]

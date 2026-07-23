@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import tomllib
 from pathlib import Path
 
@@ -59,77 +60,86 @@ class _CfgData:
     Base class for loading and providing access to configuration data and the volume.
     """
 
-    def __init__(self, cfg_path: Path, vol_file_name: str | None = None) -> None:
+    def __init__(self, cfg_path: Path, vol_index: int, exp_index: int) -> None:
         """Initialize the configuration data object.
 
         Args:
             cfg_path (Path): path to the toml config file
-            vol_file_name (str, optional): name of the volume data file to override the config. Defaults to None.
+            vol_index (int): index into the [[cell]] array selecting the volume to load
+            exp_index (int): index into the [[experiment]] array selecting the detection parameters to use
         """
         self.cfg_path = cfg_path
         self.cfg_dir = cfg_path.parent
         self.cfg = _load_config(self.cfg_path)
+        self.vol_index = vol_index
+        self.exp_index = exp_index
 
-        self._vol_data_path: Path | None = None
+        self.vol: NDArray[np.uint8] | None = _load_volume(self.vol_data_path)
 
-        if vol_file_name is not None:
-            self._vol_data_path = self.vol_data_path.with_name(vol_file_name)
-        else:
-            self._vol_data_path = self.vol_data_path
-
-        self.vol: NDArray[np.uint8] = _load_volume(self._vol_data_path)
+    def free_volume(self) -> None:
+        """Free the memory used by the volume data."""
+        self.vol = None
+        self.vol_for_analysis = None
+        gc.collect()
 
     @property
-    def vol_data_path(self) -> Path:
-        if self._vol_data_path is not None and self._vol_data_path.exists():
-            return self._vol_data_path
+    def cell(self) -> dict:
+        return self.cfg["cell"][self.vol_index]
 
-        raw = Path(self.cfg["paths"]["vol_data_path"])
-        if raw.is_absolute():
-            self._vol_data_path = raw
-        else:
-            self._vol_data_path = (self.cfg_dir / raw).resolve()
-
-        return self._vol_data_path
+    @property
+    def experiment(self) -> dict:
+        return self.cfg["experiment"][self.exp_index]
 
     @property
     def cell_name(self) -> str:
-        return self.vol_data_path.stem
+        return self.cell["name"]
+
+    @property
+    def vol_data_path(self) -> Path:
+        vol_dir = Path(self.cfg["paths"]["vol_data_dir"])
+        if not vol_dir.is_absolute():
+            vol_dir = (self.cfg_dir / vol_dir).resolve()
+
+        return vol_dir / f"{self.cell_name}.raw"
 
     @property
     def z_min(self) -> int:
-        return int(self.cfg["analysis"]["vol_top"])
+        return int(self.cell["z_min"])
 
     @z_min.setter
     def z_min(self, value: int) -> None:
-        self.cfg["analysis"]["vol_top"] = value
+        self.cell["z_min"] = value
 
     @property
     def z_max(self) -> int:
-        return int(self.cfg["analysis"]["vol_bottom"])
+        return int(self.cell["z_max"])
+
+    @z_max.setter
+    def z_max(self, value: int) -> None:
+        self.cell["z_max"] = value
 
     @property
     def voxel_size_mm(self) -> float:
-        return self.cfg["vol_info"]["voxel_size"]
+        return self.cell["voxel_size"]
 
     @property
     def slab_thickness(self) -> int:
-        return int(self.cfg["analysis"]["slab_thickness"])
+        return int(self.experiment["slab_thickness"])
 
     @slab_thickness.setter
     def slab_thickness(self, value: int) -> None:
-        self.cfg["analysis"]["slab_thickness"] = value
+        self.experiment["slab_thickness"] = value
 
     @property
     def baseline_method(self) -> str:
-        return self.cfg["analysis"]["baseline_method"]
+        return self.experiment["baseline_method"]
 
     @baseline_method.setter
     def baseline_method(self, method: str) -> None:
         if method not in ("mean", "median"):
             raise ValueError(f"Invalid baseline method: {method}")
 
-        self.cfg["analysis"]["baseline_method"] = method
+        self.experiment["baseline_method"] = method
 
     @property
     def dead_zone_scale(self) -> float:
@@ -180,32 +190,44 @@ class _CfgData:
         return self.cfg["analysis"]["slices_per_chunk"]
 
     @property
+    def n_workers(self) -> int:
+        return self.cfg["analysis"]["n_workers"]
+
+    @property
+    def preprocess_slices_per_chunk(self) -> int:
+        return self.cfg["analysis"]["preprocess_slices_per_chunk"]
+
+    @property
+    def preprocess_n_workers(self) -> int:
+        return self.cfg["analysis"]["preprocess_n_workers"]
+
+    @property
     def z_extent_max(self) -> int:
-        return self.cfg["analysis"]["z_extent_max"]
+        return self.experiment["z_extent_max"]
 
     @property
     def vol_threshold(self) -> int:
-        return self.cfg["analysis"]["vol_threshold"]
+        return self.experiment["vol_threshold"]
 
     @property
     def high_threshold_scale(self) -> float:
-        return self.cfg["analysis"]["high_threshold_scale"]
+        return self.experiment["high_threshold_scale"]
 
     @property
     def low_threshold_scale(self) -> float:
-        return self.cfg["analysis"]["low_threshold_scale"]
+        return self.experiment["low_threshold_scale"]
 
     @property
     def small_vol_cutoff(self) -> int:
-        return self.cfg["analysis"]["small_vol_cutoff"]
+        return self.experiment["small_vol_cutoff"]
 
     @property
     def aniso_factor(self) -> float:
-        return self.cfg["analysis"]["aniso_factor"]
+        return self.experiment["aniso_factor"]
 
     @property
     def small_z_bounds(self) -> tuple[int, int]:
-        bounds = self.cfg["analysis"]["small_z_bounds"]
+        bounds = self.experiment["small_z_bounds"]
         if isinstance(bounds, list) and len(bounds) == 2:
             return tuple(bounds)
         raise ValueError(
@@ -214,7 +236,7 @@ class _CfgData:
 
     @property
     def z_pad(self) -> int:
-        return self.cfg["analysis"]["z_pad"]
+        return self.experiment["z_pad"]
 
 
 class AnalysisBase(_CfgData):
@@ -223,8 +245,8 @@ class AnalysisBase(_CfgData):
     basic pre-analysis operations.
     """
 
-    def __init__(self, cfg_path: Path, vol_file_name: str | None = None) -> None:
-        super().__init__(cfg_path, vol_file_name)
+    def __init__(self, cfg_path: Path, vol_index: int, exp_index: int) -> None:
+        super().__init__(cfg_path, vol_index, exp_index)
         self._grayscale_landmarks: dict[str, int] | None = None
 
     def histogram(self, slice_steps: int | None = None) -> NDArray:
@@ -255,6 +277,16 @@ class AnalysisBase(_CfgData):
         Returns the volume subset that should be used for analysis, based on the configured top and bottom slice indices.
         """
         return self.vol[self.z_min : self.z_max + 1]
+
+    @vol_for_analysis.setter
+    def vol_for_analysis(self, value: NDArray[np.uint8] | None) -> None:
+        """
+        Sets the volume subset for analysis. This allows for replacing the volume data with a modified version if needed.
+
+        Args:
+            value (NDArray[np.uint8] | None): The new volume data to be used for analysis.
+        """
+        self.vol = value
 
     @property
     def grayscale_landmarks(self) -> dict[str, int]:

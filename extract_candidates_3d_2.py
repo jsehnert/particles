@@ -28,15 +28,6 @@ class ResidualSource(Protocol):
         sigma_R shaped (z1-z0,1,1), (z1-z0,H,W), or broadcastable."""
         ...
 
-    # OPTIONAL grayscale capability (duck-typed, not required by the protocol):
-    # a source MAY additionally provide
-    #     read_grayscale(z0, z1) -> NDArray[np.uint8] | None
-    # returning the RAW grayscale slab aligned to the same analysis-frame z-range
-    # as ``read`` (shape (z1-z0, H, W)), or None when unavailable. Detection
-    # computes grayscale features and the per-candidate voxel dump only when a
-    # non-None grayscale slab is supplied; otherwise behaviour (and the candidate
-    # set) is bit-identical to a residual-only source.
-
 
 class MemmapResidualSource:
     """Picklable, process-safe residual source backed by an on-disk memmap.
@@ -114,62 +105,30 @@ class PrecomputedResidualSource:
         shape: tuple[int, int, int],
         sigma: NDArray[np.float32],
         dtype: np.dtype = np.dtype(np.int16),
-        grayscale_path: str | None = None,
-        grayscale_shape: tuple[int, int, int] | None = None,
-        grayscale_dtype: np.dtype = np.dtype(np.uint8),
-        grayscale_z_offset: int = 0,
     ):
-        """``grayscale_*``: optional spec of the RAW grayscale volume file (the
-        original reconstruction on disk), enabling ``read_grayscale`` for
-        grayscale features / the voxel dump during detection. Metadata only —
-        the file is opened lazily and read-only in each worker (page-cache
-        shared), exactly like the residual. ``grayscale_z_offset`` maps the
-        analysis frame to the raw volume frame (i.e. ``z_min``): analysis slice
-        ``n`` is raw slice ``n + grayscale_z_offset``. When ``grayscale_path``
-        is None the source is residual-only and detection behaviour is
-        unchanged."""
         self.residual_path = residual_path
         self.shape = shape
         self.sigma = np.asarray(sigma, dtype=np.float32)  # (Z,), per-slice noise
         self.dtype = np.dtype(dtype)
         self._vol: np.memmap | None = None
-        self.grayscale_path = grayscale_path
-        self.grayscale_shape = grayscale_shape
-        self.grayscale_dtype = np.dtype(grayscale_dtype)
-        self.grayscale_z_offset = int(grayscale_z_offset)
-        self._gs: np.memmap | None = None
         assert self.sigma.shape == (shape[0],), (
             f"sigma must be per-slice length Z={shape[0]}, got {self.sigma.shape}"
         )
-        if grayscale_path is not None:
-            assert grayscale_shape is not None, (
-                "grayscale_shape (full raw volume shape) is required with "
-                "grayscale_path"
-            )
-            gz = grayscale_shape[0]
-            assert self.grayscale_z_offset + shape[0] <= gz, (
-                f"analysis range [{self.grayscale_z_offset}, "
-                f"{self.grayscale_z_offset + shape[0]}) exceeds raw volume Z={gz}"
-            )
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state["_vol"] = None  # drop the open handle; re-open in the worker
-        state["_gs"] = None
         return state
 
     def free_volume(self) -> None:
-        """Close the memmap handles to free the OS page cache. Both are
+        """Close the memmap handle to free the OS page cache. The residual is
         re-opened lazily on next access."""
         if self._vol is not None:
             del self._vol
             self._vol = None
-        if self._gs is not None:
-            del self._gs
-            self._gs = None
-        import gc
+            import gc
 
-        gc.collect()
+            gc.collect()
 
     @property
     def vol(self) -> np.memmap:
@@ -185,30 +144,6 @@ class PrecomputedResidualSource:
         sigma_R = self.sigma[z0:z1][:, None, None]  # (z1-z0, 1, 1)
         return R, sigma_R
 
-    @property
-    def gs_vol(self) -> np.memmap | None:
-        if self.grayscale_path is None:
-            return None
-        if self._gs is None:
-            self._gs = np.memmap(
-                self.grayscale_path,
-                dtype=self.grayscale_dtype,
-                mode="r",
-                shape=self.grayscale_shape,
-            )
-        return self._gs
-
-    def read_grayscale(self, z0: int, z1: int) -> NDArray[np.uint8] | None:
-        """Raw grayscale slab for analysis-frame slices [z0, z1), or None when no
-        grayscale volume was configured. Aligned to the same z-range as ``read``:
-        analysis slice n maps to raw slice n + grayscale_z_offset."""
-        gs = self.gs_vol
-        if gs is None:
-            return None
-        g0 = z0 + self.grayscale_z_offset
-        g1 = z1 + self.grayscale_z_offset
-        return np.asarray(gs[g0:g1])
-
 
 def precompute_residual(
     src: ResidualSource,
@@ -218,10 +153,6 @@ def precompute_residual(
     verbose: bool = True,
     residual_dtype: np.dtype = np.dtype(np.int16),
     flush_every: int = 0,
-    grayscale_path: str | None = None,
-    grayscale_shape: tuple[int, int, int] | None = None,
-    grayscale_dtype: np.dtype = np.dtype(np.uint8),
-    grayscale_z_offset: int = 0,
 ) -> PrecomputedResidualSource:
     """Stage 1: materialize the residual + per-slice sigma to disk, once, serially.
 
@@ -270,17 +201,6 @@ def precompute_residual(
             to ~``N`` chunks' worth if the background write-back can't keep up and RAM
             pressure appears late in a long run. Durability at completion is
             guaranteed by the final flush regardless of this setting.
-        grayscale_path: optional path to the RAW grayscale volume file on disk.
-            When given, the returned source exposes ``read_grayscale`` so stage-2
-            detection can compute grayscale features and the per-candidate voxel
-            dump. Nothing is copied or stored — this is metadata pointing at the
-            file that already exists; workers open it read-only and lazily.
-        grayscale_shape: full (Z, H, W) of the raw volume file (required with
-            ``grayscale_path``; the raw file is headerless so shape must be
-            supplied, exactly as for the residual memmap).
-        grayscale_dtype: raw volume dtype (default uint8).
-        grayscale_z_offset: maps the analysis frame to the raw frame; pass the
-            same ``z_min`` used to slice ``vol_for_analysis`` from the raw volume.
 
     Returns:
         A ready ``PrecomputedResidualSource`` over the written files, to hand to
@@ -332,14 +252,7 @@ def precompute_residual(
     del resid  # close the w+ handle before anything re-opens read-only
 
     return PrecomputedResidualSource(
-        residual_path=residual_path,
-        shape=(Z, H, W),
-        sigma=sigma,
-        dtype=rdt,
-        grayscale_path=grayscale_path,
-        grayscale_shape=grayscale_shape,
-        grayscale_dtype=grayscale_dtype,
-        grayscale_z_offset=grayscale_z_offset,
+        residual_path=residual_path, shape=(Z, H, W), sigma=sigma, dtype=rdt
     )
 
 
@@ -372,23 +285,6 @@ class Candidate:
     fill_pca: float  # fill fraction of the PCA-aligned ellipsoid
     diag: float  # diagonal length of the PCA-aligned ellipsoid
     radial_pos: float  # radial position from the center of the volume
-    # --- integer peak voxel, global frame: the exact, float-free join key that
-    # links this row to its voxel-dump records (with volume_name; experiment is
-    # implied by the output folder, matching the candidates.csv convention) ---
-    peak_z: int = -1
-    peak_y: int = -1
-    peak_x: int = -1
-    # --- grayscale features (NaN when the source provides no grayscale) ---
-    gs_median: float = float("nan")  # median raw value over the grown mask
-    gs_p90: float = float("nan")  # 90th-percentile raw value over the grown mask
-    gs_peak: float = float("nan")  # max raw value over the grown mask
-    gs_shell_median: float = float("nan")  # median raw value of the outer shell
-    gs_contrast: float = float(
-        "nan"
-    )  # inner-edge median minus shell median (raw units)
-    # metal-threshold surrogate used for the grayscale shell exclusion, echoed per
-    # row so the feature table is self-describing for offline recomputation
-    metal_threshold: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -406,18 +302,6 @@ class DetectParams:
     z_pad: int = 2
     min_fill: float = 0.15
     z_offset: int = 0
-    # metal-threshold SURROGATE (volume-level scalar, e.g. GlobalData.metal_threshold).
-    # Used to exclude bright metal from grayscale shell statistics via
-    # ``grayscale > metal_threshold`` — an approximation of the real per-slice
-    # hysteresis mask (which is not carried into stage 2), chosen deliberately so
-    # live features and offline recomputation from the voxel dump apply the
-    # IDENTICAL rule. NaN disables the surrogate (R != 0 exclusion still applies).
-    metal_threshold: float = float("nan")
-    # padding (voxels, per side) of the grown component's bbox for the voxel dump.
-    # Must be >= the largest shell radius you ever want to recompute offline;
-    # shells themselves are NOT stored — they are re-derived offline from the
-    # in_grown geometry, so the dump stays radius/connectivity agnostic.
-    voxel_margin: int = 5
 
 
 def iter_slabs(Z: int, chunk: int, halo: int) -> Iterator[tuple[int, int, int, int]]:
@@ -557,137 +441,6 @@ def _shell_features(
     return edge_contrast, decay_drop
 
 
-def _grayscale_features(
-    G: NDArray[np.uint8],
-    R: FloatArray,
-    labels: NDArray[np.integer],
-    sl: tuple[slice, slice, slice],
-    lid: int,
-    structure: NDArray[np.bool_],
-    metal_threshold: float,
-    shell_radius: int = 3,
-) -> tuple[float, float, float, float, float]:
-    """Raw-grayscale level and lateral-surround contrast of a component.
-
-    Returns ``(gs_median, gs_p90, gs_peak, gs_shell_median, gs_contrast)``, all in
-    raw grayscale units, recovering the two channels the residual discards by
-    construction:
-
-    gs_median / gs_p90 / gs_peak: absolute attenuation LEVEL over the grown mask.
-        High-Z contaminants sit at high absolute values; blobs on/near the Cu
-        anode foil read high-absolute even at modest residual SNR (the Cu-foil FP
-        discriminator).
-    gs_shell_median: absolute level of the outer surround shell (distance
-        2..shell_radius), for context.
-    gs_contrast: inner-edge median minus gs_shell_median. A real particle is a
-        LATERAL local maximum, so gs_contrast >> 0; a cathode-winding artifact
-        "surrounded by brighter pixels" produced its residual only against the
-        z-median baseline and reads near zero or negative here (the cathode FP
-        discriminator). The residual cannot express this because its baseline is
-        axial, not lateral.
-
-    Outer-shell exclusion: voxels with ``R == 0`` (metal-zeroed / out-of-support
-    upstream, mirroring ``_shell_features``) and, when ``metal_threshold`` is
-    finite, voxels with ``grayscale > metal_threshold`` (the volume-level
-    SURROGATE for the per-slice hysteresis metal mask, which is not carried into
-    stage 2). The surrogate is used both live and offline so the two computations
-    agree exactly; it is deliberately not the real grown/hysteresis mask. The
-    inner edge is grown mask, never metal, so no exclusion applies there.
-
-    Shell values are NaN when the shells are empty after exclusion (ringed by
-    metal / clipped by the slab edge) — read as 'no evidence', never a rejection.
-    """
-    psl = tuple(
-        slice(max(0, s.start - shell_radius), min(dim, s.stop + shell_radius))
-        for s, dim in zip(sl, G.shape)
-    )
-    comp = labels[psl] == lid
-    G_p = G[psl]
-    R_p = R[psl]
-
-    grown_vals = G_p[comp]
-    gs_median = float(np.median(grown_vals))
-    gs_p90 = float(np.percentile(grown_vals, 90))
-    gs_peak = float(grown_vals.max())
-
-    valid = R_p != 0.0  # exclude metal-zeroed / out-of-support, as _shell_features
-    if np.isfinite(metal_threshold):
-        valid &= G_p <= metal_threshold  # surrogate metal exclusion
-
-    d1 = ndimage.binary_dilation(comp, structure, iterations=1)
-    dR = d1
-    for _ in range(shell_radius - 1):
-        dR = ndimage.binary_dilation(dR, structure, iterations=1)
-
-    inner_edge = comp & ~ndimage.binary_erosion(comp, structure)
-    baseline = (dR & ~d1) & valid  # distance 2..shell_radius
-
-    if baseline.any():
-        gs_shell_median = float(np.median(G_p[baseline]))
-        gs_contrast = float(np.median(G_p[inner_edge]) - gs_shell_median)
-    else:
-        gs_shell_median = float("nan")
-        gs_contrast = float("nan")
-
-    return gs_median, gs_p90, gs_peak, gs_shell_median, gs_contrast
-
-
-def _voxel_records(
-    G: NDArray[np.uint8],
-    R: FloatArray,
-    labels: NDArray[np.integer],
-    sl: tuple[slice, slice, slice],
-    lid: int,
-    margin: int,
-    r0: int,
-    z_offset: int,
-    peak_key: tuple[int, int, int],
-) -> NDArray[np.int32]:
-    """Per-voxel dump of one candidate over its margin-dilated bbox.
-
-    Returns an int32 array of shape (n_voxels_in_padded_bbox, 9) with columns
-    ``(peak_z, peak_y, peak_x, z, y, x, residual, grayscale, in_grown)``:
-
-    - peak_z/y/x: the candidate's integer peak voxel in the GLOBAL frame — the
-      exact join key back to the feature table row (with volume_name).
-    - z/y/x: this voxel's global coordinates (z includes z_offset, matching
-      candidate coordinates).
-    - residual: the int residual value (exact — the residual is integer-valued).
-    - grayscale: the raw uint8 value.
-    - in_grown: 1 if the voxel belongs to the grown component, else 0.
-
-    The dump covers the bbox padded by ``margin`` on every side (clipped to the
-    slab), so BOTH interior and surround statistics are reconstructable offline:
-    shells are re-derived from the in_grown geometry with any radius <= margin
-    and any connectivity, rather than being frozen at dump time. Offline
-    exclusion rules reproduce the live ones from the stored columns alone
-    (``residual != 0`` and ``grayscale > metal_threshold`` with the threshold
-    echoed in the feature table).
-    """
-    psl = tuple(
-        slice(max(0, s.start - margin), min(dim, s.stop + margin))
-        for s, dim in zip(sl, G.shape)
-    )
-    comp = labels[psl] == lid
-    nz = psl[0].stop - psl[0].start
-    ny = psl[1].stop - psl[1].start
-    nx = psl[2].stop - psl[2].start
-
-    zz, yy, xx = np.indices((nz, ny, nx), dtype=np.int32)
-    n = nz * ny * nx
-    rec = np.empty((n, 9), dtype=np.int32)
-    rec[:, 0] = peak_key[0]
-    rec[:, 1] = peak_key[1]
-    rec[:, 2] = peak_key[2]
-    rec[:, 3] = zz.ravel() + (psl[0].start + r0 + z_offset)
-    rec[:, 4] = yy.ravel() + psl[1].start
-    rec[:, 5] = xx.ravel() + psl[2].start
-    rec[:, 6] = np.rint(R[psl].ravel()).astype(np.int32)  # integer-valued residual
-    rec[:, 7] = G[psl].ravel().astype(np.int32)
-    rec[:, 8] = comp.ravel().astype(np.int32)
-    return rec
-
-
 def _process_slab(
     src: ResidualSource,
     r0: int,
@@ -695,8 +448,7 @@ def _process_slab(
     c0: int,
     c1: int,
     p: DetectParams,
-    collect_voxels: bool = False,
-) -> tuple[list[Candidate], NDArray[np.int32] | None]:
+) -> list[Candidate]:
     """Detect + measure every owned candidate in a single slab.
 
     Pure function of ``(src, slab bounds, params)`` — no shared state, no cross-slab
@@ -704,13 +456,6 @@ def _process_slab(
     so serial and parallel runs are guaranteed to produce the same candidate set
     (dedup is by centroid ownership into the disjoint core ``[c0, c1)``, which is
     independent of execution order).
-
-    Returns ``(candidates, voxel_records)``. Grayscale features are computed only
-    when the source provides ``read_grayscale`` returning a non-None slab; the
-    original candidate fields are bit-identical either way. ``voxel_records`` is a
-    single int32 array of the concatenated per-candidate dumps (see
-    ``_voxel_records``) when ``collect_voxels`` is True AND grayscale is
-    available, else None.
 
     ``structure`` is rebuilt here rather than passed in so nothing non-trivial has to
     pickle; ``generate_binary_structure`` is effectively free.
@@ -721,11 +466,6 @@ def _process_slab(
     R, sigma = src.read(r0, r1)  # (r1-r0, H, W)
     _, H, W = src.shape
     snr = R / sigma
-
-    # optional grayscale slab, aligned to the same analysis z-range
-    read_gs = getattr(src, "read_grayscale", None)
-    G: NDArray[np.uint8] | None = read_gs(r0, r1) if read_gs is not None else None
-    voxel_chunks: list[NDArray[np.int32]] = []
 
     seed_high = snr >= p.k_high  # detection seeds
     grow_low = snr >= p.k_low  # skirt mask (k_low < k_high)
@@ -740,7 +480,7 @@ def _process_slab(
 
     labels, n = ndimage.label(grown, structure=structure)
     if n == 0:
-        return [], None
+        return []
 
     ids = np.arange(1, n + 1)
     objs = ndimage.find_objects(labels)
@@ -858,41 +598,6 @@ def _process_slab(
         S_seed = float(R_sub[sub_seed].sum())
         seed_grown_ratio = S_seed / S_grown  # (0, 1]; S_grown > 0 by construction
 
-        # integer peak voxel in the GLOBAL frame — exact, float-free join key
-        peak_z = int(pz + r0 + p.z_offset)
-        peak_y = int(py)
-        peak_x = int(px)
-
-        # --- grayscale features (only when the source supplies a raw slab) ---
-        gs_median = gs_p90 = gs_peak = gs_shell_median = gs_contrast = float("nan")
-        if G is not None:
-            gs_median, gs_p90, gs_peak, gs_shell_median, gs_contrast = (
-                _grayscale_features(
-                    G=G,
-                    R=R,
-                    labels=labels,
-                    sl=sl,
-                    lid=lid,
-                    structure=structure,
-                    metal_threshold=p.metal_threshold,
-                    shell_radius=3,
-                )
-            )
-            if collect_voxels:
-                voxel_chunks.append(
-                    _voxel_records(
-                        G=G,
-                        R=R,
-                        labels=labels,
-                        sl=sl,
-                        lid=lid,
-                        margin=p.voxel_margin,
-                        r0=r0,
-                        z_offset=p.z_offset,
-                        peak_key=(peak_z, peak_y, peak_x),
-                    )
-                )
-
         out.append(
             Candidate(
                 n_voxels=n_vox,
@@ -922,51 +627,10 @@ def _process_slab(
                 fill_pca=fill_pca,
                 diag=diag,
                 radial_pos=radial_pos,
-                peak_z=peak_z,
-                peak_y=peak_y,
-                peak_x=peak_x,
-                gs_median=gs_median,
-                gs_p90=gs_p90,
-                gs_peak=gs_peak,
-                gs_shell_median=gs_shell_median,
-                gs_contrast=gs_contrast,
-                metal_threshold=p.metal_threshold,
             )
         )
 
-    voxels: NDArray[np.int32] | None = (
-        np.concatenate(voxel_chunks, axis=0) if voxel_chunks else None
-    )
-    return out, voxels
-
-
-VOXEL_FIELDS = [
-    "volume_name",
-    "peak_z",
-    "peak_y",
-    "peak_x",
-    "z",
-    "y",
-    "x",
-    "residual",
-    "grayscale",
-    "in_grown",
-]
-
-
-def write_voxel_rows(
-    writer: "object", voxels: NDArray[np.int32] | None, volume_name: str
-) -> int:
-    """Append one CSV row per dumped voxel (columns: VOXEL_FIELDS) to an
-    already-open ``csv.writer``. ``voxels`` is the int32 (n, 9) array produced by
-    ``_process_slab``; ``volume_name`` is prepended to every row, mirroring the
-    candidates.csv convention (experiment is implied by the output folder). The
-    (volume_name, peak_z, peak_y, peak_x) columns are the exact join key back to
-    the feature table. Returns the number of rows written."""
-    if voxels is None or voxels.shape[0] == 0:
-        return 0
-    writer.writerows([volume_name, *row] for row in voxels.tolist())
-    return int(voxels.shape[0])
+    return out
 
 
 def detect_candidates_streaming(
@@ -983,22 +647,11 @@ def detect_candidates_streaming(
     slices_per_chunk: int = 128,
     z_offset: int = 0,
     verbose: bool = True,
-    metal_threshold: float = float("nan"),
-    voxel_writer: "object | None" = None,
-    volume_name: str = "",
-    voxel_margin: int = 5,
 ) -> list[Candidate]:
     """Serial driver — unchanged behaviour, now a thin loop over ``_process_slab``.
 
     Kept as the single-worker reference and the baseline to diff the parallel run
     against (sort both by centroid first; only ordering differs).
-
-    Grayscale features populate automatically when ``src`` provides
-    ``read_grayscale`` (see ResidualSource); ``metal_threshold`` is the surrogate
-    used for their shell exclusion. When ``voxel_writer`` (an open ``csv.writer``
-    whose file already carries a VOXEL_FIELDS header) is given AND grayscale is
-    available, per-candidate voxel dumps are appended after each slab completes,
-    keeping only one slab's records in memory at a time.
     """
     Z, _, _ = src.shape
     halo = z_extent_max
@@ -1013,16 +666,11 @@ def detect_candidates_streaming(
         z_pad=z_pad,
         min_fill=min_fill,
         z_offset=z_offset,
-        metal_threshold=metal_threshold,
-        voxel_margin=voxel_margin,
     )
-    collect_voxels = voxel_writer is not None
 
     out: list[Candidate] = []
     for r0, r1, c0, c1 in iter_slabs(Z, slices_per_chunk, halo):
-        found, voxels = _process_slab(src, r0, r1, c0, c1, p, collect_voxels)
-        if collect_voxels:
-            write_voxel_rows(voxel_writer, voxels, volume_name)
+        found = _process_slab(src, r0, r1, c0, c1, p)
         if verbose:
             print(
                 f"    chunk z=[{c0}, {c1}) read z=[{r0}, {r1}): "
@@ -1047,10 +695,6 @@ def detect_candidates_parallel(
     z_offset: int = 0,
     n_workers: int = 3,
     verbose: bool = True,
-    metal_threshold: float = float("nan"),
-    voxel_writer: "object | None" = None,
-    volume_name: str = "",
-    voxel_margin: int = 5,
 ) -> list[Candidate]:
     """Process-parallel driver. Dispatches each slab to a loky worker and
     concatenates the per-slab candidate lists.
@@ -1061,19 +705,12 @@ def detect_candidates_parallel(
     list differs (completion order, not slab order); sort by ``centroid`` before
     diffing against a serial baseline or a lo-invariance check.
 
-    Grayscale features populate automatically when ``src`` provides
-    ``read_grayscale`` (each worker lazily re-opens the raw-volume memmap
-    read-only, page-cache shared — same pattern as the residual). When
-    ``voxel_writer`` is given AND grayscale is available, workers return their
-    per-slab voxel arrays and the PARENT writes them as slab results stream back
-    — workers never touch the CSV, so there is no concurrent-write hazard.
-
     Memory: each worker holds one read-range slab, ~= (slices_per_chunk +
     2*z_extent_max) slices of derived arrays (R, snr float32; three bool masks;
-    int32 labels; + scipy temporaries) ~= 38 MB/slice at 1425^2, plus the uint8
-    grayscale slab (~2 MB/slice) when grayscale is enabled. The read-only input
-    memmaps are shared via the OS page cache and cost ~nothing per worker,
-    PROVIDED ``src`` pickles to metadata only (see ResidualSource contract).
+    int32 labels; + scipy temporaries) ~= 38 MB/slice at 1425^2. The read-only
+    input memmap is shared via the OS page cache and costs ~nothing per worker,
+    PROVIDED ``src`` pickles to metadata only (see ResidualSource contract /
+    MemmapResidualSource). At 1425^2, halo 16: chunk 128 -> ~6.4 GB/worker.
 
     Set ``n_workers`` <= physical cores with the parent idle. Falls back to the
     serial driver when ``n_workers <= 1``.
@@ -1093,10 +730,6 @@ def detect_candidates_parallel(
             slices_per_chunk=slices_per_chunk,
             z_offset=z_offset,
             verbose=verbose,
-            metal_threshold=metal_threshold,
-            voxel_writer=voxel_writer,
-            volume_name=volume_name,
-            voxel_margin=voxel_margin,
         )
 
     from joblib import Parallel, delayed
@@ -1114,38 +747,18 @@ def detect_candidates_parallel(
         z_pad=z_pad,
         min_fill=min_fill,
         z_offset=z_offset,
-        metal_threshold=metal_threshold,
-        voxel_margin=voxel_margin,
     )
-    collect_voxels = voxel_writer is not None
 
     slabs = list(iter_slabs(Z, slices_per_chunk, halo))
 
     # backend="loky": process-based (the per-component loop is GIL-bound, so
     # threads would not help). Dynamic dispatch balances the ~Z/chunk tasks over
     # the workers; the last partial slab's imbalance is negligible at this count.
-    parallel = Parallel(n_jobs=n_workers, backend="loky", verbose=10 if verbose else 0)
-    jobs = (
-        delayed(_process_slab)(src, r0, r1, c0, c1, p, collect_voxels)
-        for (r0, r1, c0, c1) in slabs
-    )
-    try:
-        # stream results so voxel rows are written per slab (bounded memory)
-        results_iter = Parallel(
-            n_jobs=n_workers,
-            backend="loky",
-            verbose=10 if verbose else 0,
-            return_as="generator",
-        )(jobs)
-    except TypeError:  # joblib < 1.3: no return_as; fall back to full list
-        results_iter = parallel(
-            delayed(_process_slab)(src, r0, r1, c0, c1, p, collect_voxels)
-            for (r0, r1, c0, c1) in slabs
-        )
+    results: list[list[Candidate]] = Parallel(
+        n_jobs=n_workers, backend="loky", verbose=10 if verbose else 0
+    )(delayed(_process_slab)(src, r0, r1, c0, c1, p) for (r0, r1, c0, c1) in slabs)
 
     out: list[Candidate] = []
-    for found, voxels in results_iter:
-        if collect_voxels:
-            write_voxel_rows(voxel_writer, voxels, volume_name)
-        out.extend(found)
+    for chunk_result in results:
+        out.extend(chunk_result)
     return out
