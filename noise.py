@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.signal import lfilter
 
 from metal import extract_metal_mask
 from utils import identify_cylindrical_support
@@ -408,13 +409,18 @@ def _estimate_volume_slice_stat(
     slice_level: int,
     trunc_k: float,
     metal_threshold: int | None,
+    min_area: int,
+    grayscale_metal_margin: int,
 ) -> tuple[int, dict[str, object]]:
     block = volume[slice_level - 2 : slice_level + 3, :, :]
     if metal_threshold is not None:
         metal_mask = cast(
             NDArray,
             extract_metal_mask(
-                block.max(axis=0), metal_threshold, min_area=200, margin=10
+                block.max(axis=0),
+                metal_threshold,
+                min_area=min_area,
+                margin=grayscale_metal_margin,
             ),
         )
         support_mask = identify_cylindrical_support(metal_mask)
@@ -430,8 +436,10 @@ def _estimate_volume_slice_stat(
 def estimate_volume_slice_stats(
     volume: NDArray[np.uint8],
     slice_levels: Sequence[int],
+    metal_threshold: int,
+    min_area: int,
+    grayscale_metal_margin: int,
     trunc_k: float = 2.5,
-    metal_threshold: int | None = None,
     use_parallel: bool = True,
 ) -> dict[str, Any]:
     """
@@ -445,7 +453,11 @@ def estimate_volume_slice_stats(
     trunc_k
         Truncation factor for robust statistics.
     metal_threshold
-        Threshold for metal mask extraction. If None, metal mask is not computed.
+        Threshold for metal mask extraction.
+    min_area
+        Minimum area for metal mask extraction.
+    grayscale_metal_margin
+        Margin for grayscale metal mask extraction.
     use_parallel
         If True, compute per-slice statistics concurrently. If False, use the
         direct serial route.
@@ -469,14 +481,26 @@ def estimate_volume_slice_stats(
             stats_items = list(
                 executor.map(
                     lambda s_: _estimate_volume_slice_stat(
-                        volume, s_, trunc_k, metal_threshold
+                        volume,
+                        slice_level=s_,
+                        trunc_k=trunc_k,
+                        metal_threshold=metal_threshold,
+                        min_area=min_area,
+                        grayscale_metal_margin=grayscale_metal_margin,
                     ),
                     slice_indices,
                 )
             )
     else:
         stats_items = [
-            _estimate_volume_slice_stat(volume, s_, trunc_k, metal_threshold)
+            _estimate_volume_slice_stat(
+                volume,
+                slice_level=s_,
+                trunc_k=trunc_k,
+                metal_threshold=metal_threshold,
+                min_area=min_area,
+                grayscale_metal_margin=grayscale_metal_margin,
+            )
             for s_ in slice_indices
         ]
 
@@ -526,3 +550,79 @@ def estimate_volume_slice_stats(
     results["rho2_median"] = float(np.median(rho2_vals)) if rho2_vals else float("nan")
 
     return results
+
+
+# -----------------------------------------------------------------------------
+# Noise Modeling
+# -----------------------------------------------------------------------------
+
+"""
+## Noise Correlation filters
+
+Each filter below turns unit-variance white noise into a unit-variance stationary process with the requested lag correlation(s), applied along one axis at a time (`axis=2`/`1`/`0` for x/y/z). Applying separate 1-D filters along each axis makes the resulting 3-D covariance a Kronecker product of the three 1-D covariances — exact along each axis individually (diagonal neighbours in x-y come out to `rhoxy**2`, not `rhoxy`), which is the sense in which this is a "first order approximation" to a fully isotropic field.
+
+- **`ar1_filter`** — AR(1) recursion, used for the lateral (x, y) correlation `rhoxy`. Lag-*k* correlation decays as `rhoxy**k`.
+- **`ar2_filter`** — AR(2) recursion, used for the z-direction correlation. The two AR coefficients are solved from the requested lag-1/lag-2 correlations `rho1`/`rho2` via the Yule-Walker equations, so both are matched exactly (rather than only the lag-1 correlation with lag-2 falling out as `rho1**2`).
+
+Both filters seed their recursion (via `zi`) from the process's own stationary distribution, rather than the default zero initial state `scipy.signal.lfilter` would use — otherwise the first one or two slices along each axis would start with a variance deficit and only reach the target variance/correlation after a short transient."""
+
+
+def ar1_filter(x: NDArray, rho: float, axis: int) -> NDArray:
+    """First-order (AR(1)) recursive filter along `axis`.
+
+    Turns unit-variance white noise into a unit-variance AR(1) series with
+    lag-1 correlation `rho`, seeded from the process's own stationary
+    distribution so there is no start-up transient at the edges.
+    """
+    if rho == 0.0:
+        return x
+
+    b = [np.sqrt(1.0 - rho**2)]
+    a = [1.0, -rho]
+
+    seed_shape = list(x.shape)
+    seed_shape[axis] = 1
+    y_m1 = np.random.normal(size=seed_shape)  # y[-1] ~ N(0, 1)
+    zi = rho * y_m1
+
+    y, _ = lfilter(b, a, x, axis=axis, zi=zi)
+    return y
+
+
+def ar2_filter(x: NDArray, rho1: float, rho2: float, axis: int) -> NDArray:
+    """Second-order (AR(2)) recursive filter along `axis`.
+
+    Turns unit-variance white noise into a unit-variance AR(2) series with
+    lag-1/lag-2 correlations `rho1`/`rho2`, via the Yule-Walker equations.
+    Seeded the same way as `ar1_filter`, from the joint stationary
+    distribution of (y[-1], y[-2]), so there is no start-up transient.
+    """
+    if rho1 == 0.0 and rho2 == 0.0:
+        return x
+
+    # Yule-Walker: solve for the AR coefficients that reproduce rho1, rho2.
+    phi2 = (rho2 - rho1**2) / (1.0 - rho1**2)
+    phi1 = rho1 * (1.0 - phi2)
+
+    # Driving-noise variance that keeps the output at unit variance.
+    sigma_e2 = 1.0 - phi1 * rho1 - phi2 * rho2
+    if sigma_e2 <= 0.0:
+        raise ValueError(
+            f"rho1={rho1}, rho2={rho2} is not a valid AR(2) autocorrelation pair"
+        )
+
+    b = [np.sqrt(sigma_e2)]
+    a = [1.0, -phi1, -phi2]
+
+    seed_shape = list(x.shape)
+    seed_shape[axis] = 1
+    y_m2 = np.random.normal(size=seed_shape)  # y[-2] ~ N(0, 1)
+    y_m1 = rho1 * y_m2 + np.sqrt(1.0 - rho1**2) * np.random.normal(
+        size=seed_shape
+    )  # y[-1]
+    z0 = phi1 * y_m1 + phi2 * y_m2
+    z1 = phi2 * y_m1
+    zi = np.concatenate([z0, z1], axis=axis)
+
+    y, _ = lfilter(b, a, x, axis=axis, zi=zi)
+    return y

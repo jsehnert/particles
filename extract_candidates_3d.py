@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator, Optional, Protocol, TypeAlias
+from typing import Callable, Iterator, Optional, Protocol, TypeAlias
 
+import cv2
 import numpy as np
+from circle_fit import taubinSVD
 from numpy.typing import NDArray
 from scipy import ndimage
+
+from metal import extract_metal_mask
 
 FloatArray: TypeAlias = NDArray[np.float32]
 
@@ -360,6 +364,13 @@ class Candidate:
     r_peak: float
     r_peak_ratio: float
     peak_offset: float
+    # worst-case (max over seed regions) distance from a seed region's own
+    # intensity-weighted centroid to the grown centroid -- see the
+    # computation site in _process_slab for why MAX, not an average over all
+    # seed voxels combined (the latter can hide exactly the "did detection
+    # merge two nearby objects" signal this exists to catch). For
+    # n_seed_regions == 1, reduces to that single region's offset.
+    seed_offset: float
     snr_peak: float
     linearity: float
     planarity: float
@@ -371,7 +382,10 @@ class Candidate:
     seed_grown_ratio: float
     fill_pca: float  # fill fraction of the PCA-aligned ellipsoid
     diag: float  # diagonal length of the PCA-aligned ellipsoid
-    radial_pos: float  # radial position from the center of the volume
+    radial_pos: float  # normalized radial position (fraction of the fitted can
+    # radius; 0 = jelly-roll axis, ~1 = can wall, may exceed 1 at/beyond it —
+    # unclamped). Falls back to the raw volume-centre voxel distance when no can
+    # circle is available.
     # --- integer peak voxel, global frame: the exact, float-free join key that
     # links this row to its voxel-dump records (with volume_name; experiment is
     # implied by the output folder, matching the candidates.csv convention) ---
@@ -386,9 +400,38 @@ class Candidate:
     gs_contrast: float = float(
         "nan"
     )  # inner-edge median minus shell median (raw units)
+    # grayscale interquartile range (p75-p25) over the grown mask -- texture/
+    # heterogeneity of the raw attenuation LEVEL, distinct from gs_median/
+    # gs_p90/gs_peak (which only capture the level itself): a compositionally
+    # uniform metal particle should read more homogeneously bright than a
+    # partial-volume/reconstruction artifact. NaN under the same condition
+    # gs_median is (no grayscale slab available).
+    gs_iqr: float = float("nan")
     # metal-threshold surrogate used for the grayscale shell exclusion, echoed per
     # row so the feature table is self-describing for offline recomputation
     metal_threshold: float = float("nan")
+    # PCA eigenvalues of the grown component's voxel coordinates (Sheppard-
+    # corrected covariance; see _eigen_features_with_axes), largest to
+    # smallest, in voxel^2 units -- the ABSOLUTE scale that linearity/
+    # planarity/sphericity (ratios of these) discard by construction. Already
+    # computed in _process_slab for fill_pca/diag; kept here since retaining
+    # them costs nothing further. Needs a voxel_size**2 unit conversion before
+    # use across cell formats -- see ml_classifier/features.py.
+    l1: float = float("nan")
+    l2: float = float("nan")
+    l3: float = float("nan")
+    # surface-to-volume compactness: (boundary voxel count) / n_voxels, where
+    # boundary = grown voxels with at least one non-grown 6-neighbor. A
+    # complementary compactness signal to fill_pca (which measures fill of the
+    # best-fit ellipsoid -- a GLOBAL regularity measure): this instead catches
+    # voxel-level surface roughness/jaggedness a smooth continuous ellipsoid
+    # fit can miss. Dimensionless (ratio of voxel counts) -- no unit
+    # conversion needed across cell formats.
+    surface_ratio: float = float("nan")
+    # surrogate DB key, assigned by experiment_db.ExperimentRecorder.on_slab_result
+    # as each slab's candidates are persisted -- not set (-1) for callers that
+    # don't wire a DB recorder in (e.g. the aniso_pilot/min_fill_pilot CSV path).
+    candidate_id: int = -1
 
 
 @dataclass(frozen=True)
@@ -398,13 +441,37 @@ class DetectParams:
 
     k_high: float = 4.0
     k_low: float = 2.99
-    min_voxels: int = 2
+    # Minimum size (voxels) of the largest CONNECTED above-k_high component (n_seed)
+    # for a blob to be admitted. This is the noise-collapse floor, not a particle-size
+    # or false-positive-budget knob: the expected pure-noise candidate count scales as
+    # ~p^min_seed_voxels, so this is the smallest value that keeps the candidate set from
+    # being noise-dominated. Detection is deliberately sensitivity-first; genuine FP
+    # rejection is the classifier's job. (Config key + logged column: min_seed_voxels;
+    # formerly the config key vol_threshold / arg min_voxels.)
+    min_seed_voxels: int = 2
     z_extent_max: int = 10
     small_z_bounds: tuple[int, int] = (1, 4)
     small_voxel_cutoff: int = 5
     aniso_factor: float = 1.0
+    # Additive slack (VOXELS) in the anisotropy gate: z_extent > aniso_factor*lat_min + z_pad.
+    # Deliberately voxel-native, NOT a physical length — do not scale by voxel_size. The gate
+    # itself is already resolution-invariant (aniso_factor is a ratio; z_extent and lat_min
+    # scale together), and z_pad only softens the integer round-off at the boundary, which is
+    # a +/-1-voxel effect at any resolution. Physicalizing it would shrink it to sub-voxel at
+    # coarse resolution — removing the guard exactly where quantization is worst (few-voxel
+    # particles). Fixed voxel count keeps the slack matched to the quantization granularity.
     z_pad: int = 2
     min_fill: float = 0.15
+    # Master switch for the shape-discrimination gate ``_axial_ok`` (anisotropy,
+    # min_fill, the small-regime routing, and z_lo — everything EXCEPT the two
+    # load-bearing keepers, min_seed_voxels and z_extent_max). When False the whole
+    # gate is skipped and detection is recall-first: every seed-validated blob within
+    # the z_extent_max cap is emitted, and shape discrimination is deferred to the
+    # downstream classifier (which already receives all the shape features). All the
+    # shape params above remain configured but inert. Default True preserves the
+    # historical enforcing behaviour for direct callers (e.g. the aniso/min_fill
+    # pilots that study those gates); config sets it False for research runs.
+    enforce_shape_gates: bool = True
     z_offset: int = 0
     # metal-threshold SURROGATE (volume-level scalar, e.g. GlobalData.metal_threshold).
     # Used to exclude bright metal from grayscale shell statistics via
@@ -413,11 +480,39 @@ class DetectParams:
     # live features and offline recomputation from the voxel dump apply the
     # IDENTICAL rule. NaN disables the surrogate (R != 0 exclusion still applies).
     metal_threshold: float = float("nan")
+    # metal-mask parameters for the per-slab can-circle fit (radial_pos): passed
+    # straight to ``extract_metal_mask`` on the slab's 9-slice max projection.
+    # Match the volume's configured values (GlobalData.metal_min_area /
+    # metal_grayscale_margin). Only used when a grayscale slab is available and
+    # ``metal_threshold`` is finite; otherwise radial_pos falls back to the raw
+    # volume-centre distance.
+    metal_min_area: int = 100
+    metal_grayscale_margin: int = 0
     # padding (voxels, per side) of the grown component's bbox for the voxel dump.
     # Must be >= the largest shell radius you ever want to recompute offline;
     # shells themselves are NOT stored — they are re-derived offline from the
     # in_grown geometry, so the dump stays radius/connectivity agnostic.
-    voxel_margin: int = 5
+    storage_margin: int = 5
+    # shell radius (voxels) for the edge_contrast / decay_drop / grayscale shell
+    # features. Deliberately kept in DISCRETE VOXEL units, not converted to a
+    # physical length: it is a morphological reach (number of dilation iterations)
+    # whose meaning is tied to voxel-grid connectivity and the inter-slice
+    # noise-correlation structure, so holding it constant in voxels is truer to its
+    # purpose than holding it constant in microns. (Its absolute surround reach does
+    # drift with resolution — a known, accepted trade-off, not an oversight.)
+    # Exposed here instead of a bare function default so it is configurable and
+    # travels with the other detection parameters.
+    shell_radius: int = 3
+
+    def __post_init__(self) -> None:
+        # Offline shell recomputation reads from the voxel dump, so the dumped
+        # bbox padding must cover every shell ring.
+        if self.storage_margin < self.shell_radius:
+            raise ValueError(
+                f"storage_margin ({self.storage_margin}) must be >= shell_radius "
+                f"({self.shell_radius}); the voxel dump must cover the shells for "
+                "offline recomputation."
+            )
 
 
 def iter_slabs(Z: int, chunk: int, halo: int) -> Iterator[tuple[int, int, int, int]]:
@@ -566,12 +661,12 @@ def _grayscale_features(
     structure: NDArray[np.bool_],
     metal_threshold: float,
     shell_radius: int = 3,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float]:
     """Raw-grayscale level and lateral-surround contrast of a component.
 
-    Returns ``(gs_median, gs_p90, gs_peak, gs_shell_median, gs_contrast)``, all in
-    raw grayscale units, recovering the two channels the residual discards by
-    construction:
+    Returns ``(gs_median, gs_p90, gs_peak, gs_shell_median, gs_contrast, gs_iqr)``,
+    all in raw grayscale units, recovering the two channels the residual discards
+    by construction:
 
     gs_median / gs_p90 / gs_peak: absolute attenuation LEVEL over the grown mask.
         High-Z contaminants sit at high absolute values; blobs on/near the Cu
@@ -585,6 +680,10 @@ def _grayscale_features(
         z-median baseline and reads near zero or negative here (the cathode FP
         discriminator). The residual cannot express this because its baseline is
         axial, not lateral.
+    gs_iqr: interquartile range (p75-p25) of raw grayscale over the grown mask --
+        texture/heterogeneity of the attenuation LEVEL, distinct from the level
+        statistics above: a compositionally uniform metal particle should read
+        more homogeneously bright than a partial-volume/reconstruction artifact.
 
     Outer-shell exclusion: voxels with ``R == 0`` (metal-zeroed / out-of-support
     upstream, mirroring ``_shell_features``) and, when ``metal_threshold`` is
@@ -609,6 +708,8 @@ def _grayscale_features(
     gs_median = float(np.median(grown_vals))
     gs_p90 = float(np.percentile(grown_vals, 90))
     gs_peak = float(grown_vals.max())
+    q75, q25 = np.percentile(grown_vals, [75, 25])
+    gs_iqr = float(q75 - q25)
 
     valid = R_p != 0.0  # exclude metal-zeroed / out-of-support, as _shell_features
     if np.isfinite(metal_threshold):
@@ -629,7 +730,7 @@ def _grayscale_features(
         gs_shell_median = float("nan")
         gs_contrast = float("nan")
 
-    return gs_median, gs_p90, gs_peak, gs_shell_median, gs_contrast
+    return gs_median, gs_p90, gs_peak, gs_shell_median, gs_contrast, gs_iqr
 
 
 def _voxel_records(
@@ -688,6 +789,76 @@ def _voxel_records(
     return rec
 
 
+def _slab_can_geometry(
+    G: NDArray[np.uint8],
+    metal_threshold: float,
+    min_area: int,
+    margin: int,
+) -> tuple[float, float, float, NDArray[np.bool_]] | None:
+    """Per-slab jelly-roll can geometry, in the (y=row, x=col) frame of the
+    residual/grayscale arrays.
+
+    The can is an axially-extruded cylinder, so a single fit characterises the
+    whole slab. To be robust to any local dropout we max-project three slices each
+    from the top, middle and bottom of the slab (nine in total), extract the metal
+    mask with the volume's configured ``metal_threshold`` / ``min_area`` /
+    ``margin``, and take the largest external contour. That contour gives both a
+    Taubin circle fit ``(cx, cy, r)`` (for the normalized radial position) and its
+    filled interior as a boolean support mask (for gating detection to inside the
+    can).
+
+    Returns ``(cx, cy, r, inside)`` where ``cx`` is the column (x/axis-2) centre,
+    ``cy`` the row (y/axis-1) centre — matching the ``(cy, cx)`` centroid
+    convention used downstream — and ``inside`` is an ``(H, W)`` bool mask, True
+    strictly inside/on the outer contour. Returns ``None`` when no metal contour
+    is found or ``metal_threshold`` is not finite (caller then skips the gate and
+    falls back to the volume's geometric centre for radial_pos)."""
+    if not np.isfinite(metal_threshold):
+        return None
+    nz = G.shape[0]
+    mid = nz // 2
+    # 3 slices each at top / middle / bottom of the slab (deduped for thin slabs)
+    idx = sorted(
+        {
+            i
+            for i in (0, 1, 2, mid - 1, mid, mid + 1, nz - 3, nz - 2, nz - 1)
+            if 0 <= i < nz
+        }
+    )
+    proj = G[idx].max(axis=0)
+    return _can_geometry_from_projection(proj, metal_threshold, min_area, margin)
+
+
+def _can_geometry_from_projection(
+    proj: NDArray[np.uint8],
+    metal_threshold: float,
+    min_area: int,
+    margin: int,
+) -> tuple[float, float, float, NDArray[np.bool_]] | None:
+    """Fit the can circle + interior mask from an already-computed max projection
+    ``proj`` (H, W). Shared by live detection (``_slab_can_geometry``) and the
+    offline radial backfill so both apply identical mask/contour/fit logic; see
+    ``_slab_can_geometry`` for the return contract."""
+    if not np.isfinite(metal_threshold):
+        return None
+    mm = extract_metal_mask(
+        proj, int(metal_threshold), min_area=min_area, margin=margin
+    )
+    contours, _ = cv2.findContours(
+        mm.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    if not contours:
+        return None
+    outer = max(contours, key=cv2.contourArea)
+    pts = outer.reshape(-1, 2)  # (N, 2) as (x, y)
+    if len(pts) < 3:
+        return None
+    xc, yc, r, _ = taubinSVD(pts.astype(np.float64))
+    inside = np.zeros(proj.shape, dtype=np.uint8)
+    cv2.drawContours(inside, [outer], -1, 1, thickness=cv2.FILLED)
+    return float(xc), float(yc), float(r), inside.astype(bool)
+
+
 def _process_slab(
     src: ResidualSource,
     r0: int,
@@ -720,12 +891,35 @@ def _process_slab(
 
     R, sigma = src.read(r0, r1)  # (r1-r0, H, W)
     _, H, W = src.shape
-    snr = R / sigma
 
     # optional grayscale slab, aligned to the same analysis z-range
     read_gs = getattr(src, "read_grayscale", None)
     G: NDArray[np.uint8] | None = read_gs(r0, r1) if read_gs is not None else None
     voxel_chunks: list[NDArray[np.int32]] = []
+
+    # per-slab jelly-roll can geometry: the circle (cx, cy, r) normalizes the
+    # radial position, and the filled outer contour ``inside`` gates detection to
+    # the can interior. None when no grayscale slab / metal contour is available,
+    # in which case the gate is skipped and radial_pos falls back to the raw
+    # volume-centre distance.
+    geom = (
+        _slab_can_geometry(
+            G, p.metal_threshold, p.metal_min_area, p.metal_grayscale_margin
+        )
+        if G is not None
+        else None
+    )
+    if geom is not None:
+        cxc, cyc, rc, inside = geom
+        slab_circle: tuple[float, float, float] | None = (cxc, cyc, rc)
+        # strict gate: no residual (hence no seeds/candidates) outside the can.
+        # R is a fresh float32 array from ``read`` (not a memmap view), so this
+        # in-place zeroing is safe and does not touch the stored residual.
+        R[:, ~inside] = 0.0
+    else:
+        slab_circle = None
+
+    snr = R / sigma
 
     seed_high = snr >= p.k_high  # detection seeds
     grow_low = snr >= p.k_low  # skirt mask (k_low < k_high)
@@ -753,15 +947,15 @@ def _process_slab(
         sub_grown = labels[sl] == lid
         sub_seed = sub_grown & seed_high[sl]
         n_seed_total = int(sub_seed.sum())  # total seed voxels in the grown blob
-        if n_seed_total < p.min_voxels:
+        if n_seed_total < p.min_seed_voxels:
             continue  # defensive; propagation guarantees >=1 seed voxel
 
-        # --- detection criterion: a CONNECTED high core of >= min_voxels ---
+        # --- detection criterion: a CONNECTED high core of >= min_seed_voxels ---
         seed_lbl, _ = ndimage.label(sub_seed, structure=structure)
         if seed_lbl.max() == 0:
             continue  # defensive; propagation guarantees >=1 seed voxel
         n_seed = int(np.bincount(seed_lbl.ravel())[1:].max())
-        if n_seed < p.min_voxels:  # p^min_voxels logic intact at k_high
+        if n_seed < p.min_seed_voxels:  # p^min_seed_voxels logic intact at k_high
             continue
 
         # n_seed_total = int(sub_seed.sum())  # total seed voxels in the grown blob
@@ -776,10 +970,14 @@ def _process_slab(
         x_extent = sl[2].stop - sl[2].start
         fill = n_vox / (z_extent * y_extent * x_extent)  # fill fraction of the bbox
 
-        # axial-extent gate (hard cap + two-regime transience), on grown extent
+        # z_extent_max: load-bearing keeper (compute/halo envelope + streak cap),
+        # always enforced regardless of enforce_shape_gates.
         if z_extent > p.z_extent_max:
             continue
-        if not _axial_ok(
+        # _axial_ok bundles the shape-discrimination gates (anisotropy, min_fill,
+        # small-regime routing, z_lo). Skipped entirely when enforce_shape_gates is
+        # False (recall-first: defer shape discrimination to the classifier).
+        if p.enforce_shape_gates and not _axial_ok(
             z_extent=z_extent,
             y_extent=y_extent,
             x_extent=x_extent,
@@ -800,6 +998,29 @@ def _process_slab(
         # --- intensity-weighted COM over the GROWN component ---
         w = np.where(sub_grown, R_sub, 0.0)
         cz_loc, cy, cx = ndimage.center_of_mass(w)
+
+        # seed_offset: worst-case (max) distance from any individual seed
+        # region's own intensity-weighted centroid to the grown centroid.
+        # Computed here, in the pre-offset bbox-local frame -- translation
+        # cancels in a distance, so this is identical to computing it in the
+        # global frame after the sl[*].start/r0 offsets below. Deliberately
+        # the MAX over regions, not one centroid averaged over all seed
+        # voxels combined: two seed regions symmetric about the grown
+        # centroid would average back to ~0 and hide exactly the "did
+        # detection merge two nearby objects" signal this feature exists to
+        # catch -- max does not cancel that way. seed_lbl.max() >= 1 is
+        # guaranteed here (checked defensively above), so this is always
+        # well-defined, never NaN.
+        seed_region_coms = ndimage.center_of_mass(
+            R_sub, labels=seed_lbl, index=np.arange(1, seed_lbl.max() + 1)
+        )
+        seed_offset = float(
+            max(
+                np.sqrt((rz - cz_loc) ** 2 + (ry - cy) ** 2 + (rx - cx) ** 2)
+                for rz, ry, rx in seed_region_coms
+            )
+        )
+
         cz_loc += sl[0].start
         cy += sl[1].start
         cx += sl[2].start
@@ -840,6 +1061,17 @@ def _process_slab(
 
         diag = 2 * np.sqrt(3 * l1) / max(z_extent, x_extent, y_extent)
 
+        # surface-to-volume compactness: boundary voxels (grown voxels with
+        # >=1 non-grown 6-neighbor) / n_voxels. Complementary to fill_pca
+        # (which is a GLOBAL best-fit-ellipsoid regularity measure) -- this
+        # instead catches voxel-level surface roughness a smooth continuous
+        # ellipsoid fit can miss. border_value=0 (default) is exactly right
+        # here: sub_grown is already cropped to its own tight bbox, so a
+        # voxel at the array edge correctly erodes away as a true surface
+        # voxel of the shape, same as if it were surrounded by more padding.
+        boundary = sub_grown & ~ndimage.binary_erosion(sub_grown, structure)
+        surface_ratio = float(boundary.sum()) / n_vox
+
         edge_contrast, decay_drop = _shell_features(
             labels=labels,
             snr=snr,
@@ -848,10 +1080,23 @@ def _process_slab(
             sl=sl,
             lid=lid,
             structure=structure,
-            shell_radius=3,
+            shell_radius=p.shell_radius,
         )
 
-        radial_pos = np.sqrt((cy - H / 2) ** 2 + (cx - W / 2) ** 2)
+        # normalized radial position: fraction of the fitted can radius (0 = axis,
+        # ~1 = wall). Not clamped — values >1 for features at/beyond the fitted
+        # circle carry signal (see near-wall FP concentration) and the fitted
+        # radius is the outer wall surface. Falls back to the raw volume-centre
+        # voxel distance when no can circle could be fitted for this slab.
+        if slab_circle is not None:
+            cxc, cyc, rc = slab_circle
+            radial_pos = (
+                float(np.hypot(cy - cyc, cx - cxc) / rc)
+                if rc > 0
+                else float("nan")
+            )
+        else:
+            radial_pos = float(np.sqrt((cy - H / 2) ** 2 + (cx - W / 2) ** 2))
 
         # --- seed-to-grown intensity concentration ---
         S_grown = float(R_sub[sub_grown].sum())
@@ -864,9 +1109,9 @@ def _process_slab(
         peak_x = int(px)
 
         # --- grayscale features (only when the source supplies a raw slab) ---
-        gs_median = gs_p90 = gs_peak = gs_shell_median = gs_contrast = float("nan")
+        gs_median = gs_p90 = gs_peak = gs_shell_median = gs_contrast = gs_iqr = float("nan")
         if G is not None:
-            gs_median, gs_p90, gs_peak, gs_shell_median, gs_contrast = (
+            gs_median, gs_p90, gs_peak, gs_shell_median, gs_contrast, gs_iqr = (
                 _grayscale_features(
                     G=G,
                     R=R,
@@ -875,7 +1120,7 @@ def _process_slab(
                     lid=lid,
                     structure=structure,
                     metal_threshold=p.metal_threshold,
-                    shell_radius=3,
+                    shell_radius=p.shell_radius,
                 )
             )
             if collect_voxels:
@@ -886,7 +1131,7 @@ def _process_slab(
                         labels=labels,
                         sl=sl,
                         lid=lid,
-                        margin=p.voxel_margin,
+                        margin=p.storage_margin,
                         r0=r0,
                         z_offset=p.z_offset,
                         peak_key=(peak_z, peak_y, peak_x),
@@ -910,6 +1155,7 @@ def _process_slab(
                 r_peak=r_peak,
                 r_peak_ratio=r_peak_ratio,
                 peak_offset=peak_offset,
+                seed_offset=seed_offset,
                 snr_peak=snr_peak,
                 linearity=linearity,
                 planarity=planarity,
@@ -930,7 +1176,12 @@ def _process_slab(
                 gs_peak=gs_peak,
                 gs_shell_median=gs_shell_median,
                 gs_contrast=gs_contrast,
+                gs_iqr=gs_iqr,
                 metal_threshold=p.metal_threshold,
+                l1=l1,
+                l2=l2,
+                l3=l3,
+                surface_ratio=surface_ratio,
             )
         )
 
@@ -940,7 +1191,35 @@ def _process_slab(
     return out, voxels
 
 
+# trailing experiment-level param columns, shared between VOXEL_FIELDS (after
+# in_grown) and vol_analysis.py's _CANDIDATE_FIELDS (after metal_threshold) --
+# kept here as the one canonical order so both writers agree with each other
+# and with the historical combined_candidates.csv / combined_voxels.parquet
+# column order. New columns are APPENDED at the end (never inserted) so pre-existing
+# column positions never shift: min_fill, then max_axial_extent_mm, then enforce_shape_gates.
+# NOTE: z_extent_max stays here as the EFFECTIVE slice count that actually gated
+# detection (run provenance); max_axial_extent_mm is the physical spec it was derived
+# from (z_extent_max = ceil(max_axial_extent_mm / voxel_size)). enforce_shape_gates records
+# whether the _axial_ok shape gates were applied for this run (it changes the candidate SET,
+# so it is logged per row for provenance). All are logged so the row is self-describing.
+EXPERIMENT_PARAM_FIELDS = [
+    "slab_thickness",
+    "high_threshold_scale",
+    "low_threshold_scale",
+    "baseline_method",
+    "z_extent_max",
+    "min_seed_voxels",
+    "aniso_factor",
+    "small_vol_cutoff",
+    "z_pad",
+    "small_z_bounds",
+    "min_fill",
+    "max_axial_extent_mm",
+    "enforce_shape_gates",
+]
+
 VOXEL_FIELDS = [
+    "experiment_number",
     "volume_name",
     "peak_z",
     "peak_y",
@@ -951,21 +1230,36 @@ VOXEL_FIELDS = [
     "residual",
     "grayscale",
     "in_grown",
+    *EXPERIMENT_PARAM_FIELDS,
 ]
 
 
 def write_voxel_rows(
-    writer: "object", voxels: NDArray[np.int32] | None, volume_name: str
+    writer: "object",
+    voxels: NDArray[np.int32] | None,
+    volume_name: str,
+    experiment_number: int,
+    experiment_params: list[object] | None = None,
 ) -> int:
     """Append one CSV row per dumped voxel (columns: VOXEL_FIELDS) to an
     already-open ``csv.writer``. ``voxels`` is the int32 (n, 9) array produced by
-    ``_process_slab``; ``volume_name`` is prepended to every row, mirroring the
-    candidates.csv convention (experiment is implied by the output folder). The
-    (volume_name, peak_z, peak_y, peak_x) columns are the exact join key back to
-    the feature table. Returns the number of rows written."""
+    ``_process_slab``; ``experiment_number`` and ``volume_name`` are prepended to
+    every row, and ``experiment_params`` (values matching
+    ``EXPERIMENT_PARAM_FIELDS`` -- slab_thickness..min_fill, in that order) are
+    appended, so every voxel row is fully self-describing and combining across
+    experiments is a plain concatenation rather than a join against a separate
+    params.csv. The (experiment_number, volume_name, peak_z, peak_y, peak_x)
+    columns are the exact join key back to the feature table. Pass
+    ``experiment_params=None`` to omit the trailing columns entirely (only do
+    this if the header written to ``writer`` was also built without
+    ``EXPERIMENT_PARAM_FIELDS``, e.g. a caller using a bespoke schema).
+    Returns the number of rows written."""
     if voxels is None or voxels.shape[0] == 0:
         return 0
-    writer.writerows([volume_name, *row] for row in voxels.tolist())
+    extra = list(experiment_params) if experiment_params is not None else []
+    writer.writerows(
+        [experiment_number, volume_name, *row, *extra] for row in voxels.tolist()
+    )
     return int(voxels.shape[0])
 
 
@@ -973,20 +1267,27 @@ def detect_candidates_streaming(
     src: ResidualSource,
     k_high: float = 4.0,
     k_low: float = 2.99,
-    min_voxels: int = 2,
+    min_seed_voxels: int = 2,
     z_extent_max: int = 10,
     small_z_bounds: tuple[int, int] = (1, 4),
     small_voxel_cutoff: int = 5,
     aniso_factor: float = 1.0,
     z_pad: int = 2,
     min_fill: float = 0.15,
+    enforce_shape_gates: bool = True,
     slices_per_chunk: int = 128,
     z_offset: int = 0,
     verbose: bool = True,
     metal_threshold: float = float("nan"),
+    metal_min_area: int = 100,
+    metal_grayscale_margin: int = 0,
     voxel_writer: "object | None" = None,
     volume_name: str = "",
-    voxel_margin: int = 5,
+    storage_margin: int = 5,
+    shell_radius: int = 3,
+    experiment_number: int = -1,
+    experiment_params: list[object] | None = None,
+    on_slab_result: "Callable[[list[Candidate], NDArray[np.int32] | None], None] | None" = None,
 ) -> list[Candidate]:
     """Serial driver — unchanged behaviour, now a thin loop over ``_process_slab``.
 
@@ -998,31 +1299,49 @@ def detect_candidates_streaming(
     used for their shell exclusion. When ``voxel_writer`` (an open ``csv.writer``
     whose file already carries a VOXEL_FIELDS header) is given AND grayscale is
     available, per-candidate voxel dumps are appended after each slab completes,
-    keeping only one slab's records in memory at a time.
+    keeping only one slab's records in memory at a time. ``experiment_number``
+    and ``experiment_params`` (values matching ``EXPERIMENT_PARAM_FIELDS``) are
+    forwarded to ``write_voxel_rows`` so every voxel row is self-describing.
+
+    ``on_slab_result``, if given, is called once per slab as
+    ``on_slab_result(found, voxels)`` -- the same pair ``voxel_writer`` would
+    otherwise consume -- instead of/alongside the CSV path. This is how
+    experiment_db.ExperimentRecorder persists straight to DuckDB without this
+    module knowing anything about CSVs or databases; it just hands each slab's
+    result to whichever sink the caller wired up. Either or both of
+    ``voxel_writer``/``on_slab_result`` may be set.
     """
     Z, _, _ = src.shape
     halo = z_extent_max
     p = DetectParams(
         k_high=k_high,
         k_low=k_low,
-        min_voxels=min_voxels,
+        min_seed_voxels=min_seed_voxels,
         z_extent_max=z_extent_max,
         small_z_bounds=small_z_bounds,
         small_voxel_cutoff=small_voxel_cutoff,
         aniso_factor=aniso_factor,
         z_pad=z_pad,
         min_fill=min_fill,
+        enforce_shape_gates=enforce_shape_gates,
         z_offset=z_offset,
         metal_threshold=metal_threshold,
-        voxel_margin=voxel_margin,
+        metal_min_area=metal_min_area,
+        metal_grayscale_margin=metal_grayscale_margin,
+        storage_margin=storage_margin,
+        shell_radius=shell_radius,
     )
-    collect_voxels = voxel_writer is not None
+    collect_voxels = voxel_writer is not None or on_slab_result is not None
 
     out: list[Candidate] = []
     for r0, r1, c0, c1 in iter_slabs(Z, slices_per_chunk, halo):
         found, voxels = _process_slab(src, r0, r1, c0, c1, p, collect_voxels)
-        if collect_voxels:
-            write_voxel_rows(voxel_writer, voxels, volume_name)
+        if voxel_writer is not None:
+            write_voxel_rows(
+                voxel_writer, voxels, volume_name, experiment_number, experiment_params
+            )
+        if on_slab_result is not None:
+            on_slab_result(found, voxels)
         if verbose:
             print(
                 f"    chunk z=[{c0}, {c1}) read z=[{r0}, {r1}): "
@@ -1036,21 +1355,28 @@ def detect_candidates_parallel(
     src: ResidualSource,
     k_high: float = 4.0,
     k_low: float = 2.99,
-    min_voxels: int = 2,
+    min_seed_voxels: int = 2,
     z_extent_max: int = 10,
     small_z_bounds: tuple[int, int] = (1, 4),
     small_voxel_cutoff: int = 5,
     aniso_factor: float = 1.0,
     z_pad: int = 2,
     min_fill: float = 0.15,
+    enforce_shape_gates: bool = True,
     slices_per_chunk: int = 128,
     z_offset: int = 0,
     n_workers: int = 3,
     verbose: bool = True,
     metal_threshold: float = float("nan"),
+    metal_min_area: int = 100,
+    metal_grayscale_margin: int = 0,
     voxel_writer: "object | None" = None,
     volume_name: str = "",
-    voxel_margin: int = 5,
+    storage_margin: int = 5,
+    shell_radius: int = 3,
+    experiment_number: int = -1,
+    experiment_params: list[object] | None = None,
+    on_slab_result: "Callable[[list[Candidate], NDArray[np.int32] | None], None] | None" = None,
 ) -> list[Candidate]:
     """Process-parallel driver. Dispatches each slab to a loky worker and
     concatenates the per-slab candidate lists.
@@ -1064,9 +1390,12 @@ def detect_candidates_parallel(
     Grayscale features populate automatically when ``src`` provides
     ``read_grayscale`` (each worker lazily re-opens the raw-volume memmap
     read-only, page-cache shared — same pattern as the residual). When
-    ``voxel_writer`` is given AND grayscale is available, workers return their
-    per-slab voxel arrays and the PARENT writes them as slab results stream back
-    — workers never touch the CSV, so there is no concurrent-write hazard.
+    ``voxel_writer`` and/or ``on_slab_result`` is given AND grayscale is
+    available, workers return their per-slab voxel arrays and the PARENT
+    consumes them as slab results stream back — workers never touch the CSV or
+    DB, so there is no concurrent-write hazard (the ``for found, voxels in
+    results_iter:`` loop below is serial in the parent process). See
+    ``detect_candidates_streaming`` for what ``on_slab_result`` receives.
 
     Memory: each worker holds one read-range slab, ~= (slices_per_chunk +
     2*z_extent_max) slices of derived arrays (R, snr float32; three bool masks;
@@ -1083,20 +1412,27 @@ def detect_candidates_parallel(
             src,
             k_high=k_high,
             k_low=k_low,
-            min_voxels=min_voxels,
+            min_seed_voxels=min_seed_voxels,
             z_extent_max=z_extent_max,
             small_z_bounds=small_z_bounds,
             small_voxel_cutoff=small_voxel_cutoff,
             aniso_factor=aniso_factor,
             z_pad=z_pad,
             min_fill=min_fill,
+            enforce_shape_gates=enforce_shape_gates,
             slices_per_chunk=slices_per_chunk,
             z_offset=z_offset,
             verbose=verbose,
             metal_threshold=metal_threshold,
+            metal_min_area=metal_min_area,
+            metal_grayscale_margin=metal_grayscale_margin,
             voxel_writer=voxel_writer,
             volume_name=volume_name,
-            voxel_margin=voxel_margin,
+            storage_margin=storage_margin,
+            shell_radius=shell_radius,
+            experiment_number=experiment_number,
+            experiment_params=experiment_params,
+            on_slab_result=on_slab_result,
         )
 
     from joblib import Parallel, delayed
@@ -1106,18 +1442,22 @@ def detect_candidates_parallel(
     p = DetectParams(
         k_high=k_high,
         k_low=k_low,
-        min_voxels=min_voxels,
+        min_seed_voxels=min_seed_voxels,
         z_extent_max=z_extent_max,
         small_z_bounds=small_z_bounds,
         small_voxel_cutoff=small_voxel_cutoff,
         aniso_factor=aniso_factor,
         z_pad=z_pad,
         min_fill=min_fill,
+        enforce_shape_gates=enforce_shape_gates,
         z_offset=z_offset,
         metal_threshold=metal_threshold,
-        voxel_margin=voxel_margin,
+        metal_min_area=metal_min_area,
+        metal_grayscale_margin=metal_grayscale_margin,
+        storage_margin=storage_margin,
+        shell_radius=shell_radius,
     )
-    collect_voxels = voxel_writer is not None
+    collect_voxels = voxel_writer is not None or on_slab_result is not None
 
     slabs = list(iter_slabs(Z, slices_per_chunk, halo))
 
@@ -1145,7 +1485,11 @@ def detect_candidates_parallel(
 
     out: list[Candidate] = []
     for found, voxels in results_iter:
-        if collect_voxels:
-            write_voxel_rows(voxel_writer, voxels, volume_name)
+        if voxel_writer is not None:
+            write_voxel_rows(
+                voxel_writer, voxels, volume_name, experiment_number, experiment_params
+            )
+        if on_slab_result is not None:
+            on_slab_result(found, voxels)
         out.extend(found)
     return out

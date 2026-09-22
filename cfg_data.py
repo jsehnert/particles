@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import tomllib
 from pathlib import Path
 
@@ -16,43 +17,13 @@ def _load_config(cfg_path: Path) -> dict:
         return tomllib.load(f)
 
 
-def _parse_metadata(meta_path: Path) -> dict[str, str]:
-    metadata: dict[str, str] = {}
-    if not meta_path.exists():
-        existing_stem = "M50L-06"
-        new_meta_path = meta_path.with_name(f"{existing_stem}.xtekhelixct")
-
-        print(
-            f"Using metadata file {new_meta_path} instead of {meta_path}, exists={new_meta_path.exists()}"
-        )
-        if new_meta_path.exists():
-            print(
-                f"Warning: Metadata file {meta_path} not found. Using {new_meta_path} instead."
-            )
-            meta_path = new_meta_path
-
-    with meta_path.open() as f:
-        for line in f:
-            line = line.strip()
-            if "=" in line:
-                key, _, value = line.partition("=")
-                metadata[key.strip()] = value.strip()
-    return metadata
-
-
-def _load_volume(volume_path: Path) -> NDArray[np.uint8]:
-    meta_path = volume_path.with_suffix(".xtekhelixct")
-    metadata = _parse_metadata(meta_path)
-
-    x = int(metadata["VoxelsX"])
-    y = int(metadata["VoxelsY"])
-    z = int(metadata["VoxelsZ"])
-
+def _load_volume(volume_path: Path, voxels_x: int, voxels_y: int) -> NDArray[np.uint8]:
     dtype: type[np.uint8] | type[np.float32] = (
         np.float32 if volume_path.suffix == ".vol" else np.uint8
     )
 
-    return np.memmap(volume_path, dtype=dtype, mode="r", shape=(z, y, x))
+    z = (volume_path.stat().st_size) // (voxels_y * voxels_x * np.dtype(dtype).itemsize)
+    return np.memmap(volume_path, dtype=dtype, mode="r", shape=(z, voxels_y, voxels_x))
 
 
 class _CfgData:
@@ -74,7 +45,9 @@ class _CfgData:
         self.vol_index = vol_index
         self.exp_index = exp_index
 
-        self.vol: NDArray[np.uint8] | None = _load_volume(self.vol_data_path)
+        self.vol: NDArray[np.uint8] | None = _load_volume(
+            self.vol_data_path, self.voxels_x, self.voxels_y
+        )
 
     def free_volume(self) -> None:
         """Free the memory used by the volume data."""
@@ -85,6 +58,14 @@ class _CfgData:
     @property
     def cell(self) -> dict:
         return self.cfg["cell"][self.vol_index]
+
+    @property
+    def voxels_x(self) -> int:
+        return int(self.cell["voxels_x"])
+
+    @property
+    def voxels_y(self) -> int:
+        return int(self.cell["voxels_y"])
 
     @property
     def experiment(self) -> dict:
@@ -121,6 +102,18 @@ class _CfgData:
     @property
     def voxel_size_mm(self) -> float:
         return self.cell["voxel_size"]
+
+    @property
+    def form_factor(self) -> str:
+        return self.cell["form_factor"]
+
+    @property
+    def nominal_diameter_mm(self) -> float:
+        return float(self.cell["nominal_diameter_mm"])
+
+    @property
+    def nominal_height_mm(self) -> float:
+        return float(self.cell["nominal_height_mm"])
 
     @property
     def slab_thickness(self) -> int:
@@ -162,7 +155,18 @@ class _CfgData:
         return self.cfg["grayscale_landmarks"]["slice_step"]
 
     @property
+    def metal_offset_percentile(self) -> int:
+        return self.cfg["metal"]["metal_offset_percentile"]
+
+    @metal_offset_percentile.setter
+    def metal_offset_percentile(self, value: int) -> None:
+        self.cfg["metal"]["metal_offset_percentile"] = value
+
+    @property
     def metal_grayscale_margin(self) -> int:
+        # A uint8 grayscale delta for the metal-mask hysteresis (the low band is
+        # metal_threshold - margin), NOT a spatial distance — resolution-independent
+        # by nature, so it is stored and used directly with no voxel_size scaling.
         return self.cfg["metal"]["gray_margin"]
 
     @metal_grayscale_margin.setter
@@ -171,11 +175,14 @@ class _CfgData:
 
     @property
     def metal_min_area(self) -> int:
-        return self.cfg["metal"]["min_area"]
+        # Stored as a physical area (mm^2); converted to pixel count with this
+        # cell's voxel_size (area scales as 1/voxel_size**2).
+        return round(self.cfg["metal"]["min_area_mm2"] / self.voxel_size_mm**2)
 
     @metal_min_area.setter
     def metal_min_area(self, value: int) -> None:
-        self.cfg["metal"]["min_area"] = value
+        # Callers speak pixels; store back as a physical area (mm^2).
+        self.cfg["metal"]["min_area_mm2"] = value * self.voxel_size_mm**2
 
     @property
     def area_threshold(self) -> int:
@@ -190,6 +197,21 @@ class _CfgData:
         return self.cfg["analysis"]["slices_per_chunk"]
 
     @property
+    def storage_margin(self) -> int:
+        return int(self.cfg["analysis"]["storage_margin"])
+
+    @property
+    def shell_radius(self) -> int:
+        return int(self.cfg["analysis"]["shell_radius"])
+
+    @property
+    def enforce_shape_gates(self) -> bool:
+        # When False (research default), detection skips the _axial_ok shape gates
+        # and defers shape discrimination to the classifier; min_seed_voxels and
+        # z_extent_max still gate.
+        return bool(self.cfg["analysis"]["enforce_shape_gates"])
+
+    @property
     def n_workers(self) -> int:
         return self.cfg["analysis"]["n_workers"]
 
@@ -202,12 +224,21 @@ class _CfgData:
         return self.cfg["analysis"]["preprocess_n_workers"]
 
     @property
-    def z_extent_max(self) -> int:
-        return self.experiment["z_extent_max"]
+    def max_axial_extent_mm(self) -> float:
+        return float(self.experiment["max_axial_extent_mm"])
 
     @property
-    def vol_threshold(self) -> int:
-        return self.experiment["vol_threshold"]
+    def z_extent_max(self) -> int:
+        # Physical axial ceiling converted to whole slices for THIS cell's voxel_size,
+        # so the FP filter (and the slab halo it also sizes) is resolution-independent.
+        # ceil, not round: rounding a ceiling down could clip a borderline real
+        # particle, so err toward keeping candidates (sensitivity-first; FP is the
+        # classifier's job). Isotropic reconstruction => voxel_size is the z spacing.
+        return math.ceil(self.max_axial_extent_mm / self.voxel_size_mm)
+
+    @property
+    def min_seed_voxels(self) -> int:
+        return self.experiment["min_seed_voxels"]
 
     @property
     def high_threshold_scale(self) -> float:
@@ -260,6 +291,9 @@ class AnalysisBase(_CfgData):
         Returns:
             NDArray: The histogram counts of the volume data.
         """
+        if self.vol is None:
+            raise ValueError("Volume data is not loaded.")
+
         if slice_steps is None:
             slice_steps = self.grayscale_slice_step
 
@@ -276,6 +310,9 @@ class AnalysisBase(_CfgData):
         """
         Returns the volume subset that should be used for analysis, based on the configured top and bottom slice indices.
         """
+        if self.vol is None:
+            raise ValueError("Volume data is not loaded.")
+
         return self.vol[self.z_min : self.z_max + 1]
 
     @vol_for_analysis.setter
@@ -304,7 +341,9 @@ class AnalysisBase(_CfgData):
         )
 
         metal_threshold = estimate_metal_threshold(
-            self.vol_for_analysis, air_grayvalue, self.grayscale_slice_step
+            self.vol_for_analysis,
+            slice_step=self.grayscale_slice_step,
+            offset_percentile=self.metal_offset_percentile,
         )
 
         self._grayscale_landmarks = {

@@ -1,12 +1,43 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 from numba import njit, prange
 from numpy.typing import NDArray
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from scipy.signal import find_peaks
 from sklearn.mixture import GaussianMixture
+
+
+def _dbg_display(
+    img: np.ndarray,
+    exit: bool = False,
+    path: str = str(Path(__file__).resolve().parent / "Graphics" / "dbg_display.png"),
+) -> None:
+    """Save `img` as a normalized PNG for debug review (thread-safe, unlike plt.show()).
+
+    Args:
+        img: 2D array to visualize. Rescaled so its max value maps to 255.
+        exit: If True, sys.exit() right after saving, short-circuiting the caller.
+        path: Output PNG path.
+    """
+    img = img.astype(np.float32)
+    max_val = img.max()
+    if max_val > 0:
+        img = img / max_val * 255
+    ok = cv2.imwrite(path, img.astype(np.uint8))
+    if not ok:
+        # cv2.imwrite fails silently (returns False) rather than raising, so check
+        # explicitly -- otherwise a bad path/permission issue vanishes with no signal.
+        raise RuntimeError(f"cv2.imwrite failed to write debug image to {path!r}")
+    print(f"[_dbg_display] wrote {path}")
+
+    if exit:
+        import sys
+
+        sys.exit()
 
 
 def gaussian_mixture_fit(
@@ -50,9 +81,80 @@ def estimate_grayscale_range(
         vol: The input volume as a 3D numpy array.
         slice_step: The step size for selecting slices to analyze.
     Returns:
+        A tuple containing the estimated air gray value, the core gray value, and the (effective) max gray value.
+
+    Notes:
+        - This code was developed for raw cylindrical battery cel volumes after Glimpse post-processing
+        - The air gray value is estimated as the lowest significant peak in the histogram, which typically
+          corresponds to the background (air) in CT scans.
+          - Any grayvalue at or below the air gray value should be considered as air.
+        - The max gray value is estimated as the overall max from the analyzed slices
+    """
+
+    # Set the slice levels for analysis. Always including the first and last slice.
+    def _build_hist(vol: NDArray[np.uint8], slice_step: int = 200):
+        slice_levels = np.arange(0, vol.shape[0], slice_step)
+        slice_levels = np.append(slice_levels, vol.shape[0] - 1)
+        histogram = np.zeros(256, dtype=float)
+        for sl in slice_levels:
+            img = vol[sl]
+            hist = cv2.calcHist([img], [0], None, [256], [0, 256]).squeeze()
+            histogram += hist
+        return histogram
+
+    def _process_hist(hist: NDArray) -> NDArray:
+        hist[0] = hist[2]
+        hist[1] = hist[2]
+        hist[-1] = hist[-2]
+        hist = gaussian_filter1d(hist, sigma=3)
+        return hist
+
+    hist = _build_hist(vol, slice_step=slice_step)
+    hist = _process_hist(hist)
+
+    # Identify the core gray value as the first peak in the inverted histogram
+    neg_hist = -hist
+    neg_hist = neg_hist - neg_hist.min()
+    pks, _ = find_peaks(neg_hist, height=neg_hist.max() / 2, width=1)
+    if len(pks) < 1:
+        raise ValueError("No significant peaks found in the inverted histogram.")
+    core_grayvalue = pks[0]
+    air_grayvalue = 2
+
+    # March down from the clipped saturation level to find the useable maximum value
+    max_grayvalue = 254
+    hist_threshold = hist[max_grayvalue] // 2
+    while True:
+        h_value = hist[max_grayvalue - 1]
+        if h_value < hist_threshold:
+            break
+        max_grayvalue -= 1
+
+    pks, _ = find_peaks(hist, height=hist.max() / 2, width=1)
+    if len(pks) < 1:
+        raise ValueError("No significant peaks found in the histogram.")
+
+    max_grayvalue = max(max_grayvalue, pks[-1] + 10)
+    max_grayvalue = min(max_grayvalue, 253)
+
+    return air_grayvalue, core_grayvalue, max_grayvalue
+
+
+def estimate_grayscale_range_for_Nikon_raw(
+    vol: np.ndarray, slice_step: int = 200
+) -> tuple[int, int, int]:
+    """
+    For the given volume, estimate the air gray value and the max gray value by analyzing histograms of slices.
+
+    Args:
+        vol: The input volume as a 3D numpy array.
+        slice_step: The step size for selecting slices to analyze.
+    Returns:
         A tuple containing the estimated air gray value and the max gray value.
 
     Notes:
+        - This code was developed for the analysis of Nikon produced 8-bit raw volumes prior to Glimpse
+          post-processing.
         - The air gray value is estimated as the lowest significant peak in the histogram, which typically
           corresponds to the background (air) in CT scans.
           - Any grayvalue at or below the air gray value should be considered as air.
@@ -101,6 +203,9 @@ def identify_cylindrical_support(metal_mask: NDArray[np.bool_]) -> NDArray[np.bo
         metal_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
     if not contours:
+        # print("[identify_cylindrical_support] No contours found; caller stack:")
+        # print("".join(traceback.format_stack(limit=3)[:-1]))
+        _dbg_display(metal_mask, exit=True)
         raise ValueError("No contours found in the metal mask.")
     outer_contour = max(contours, key=cv2.contourArea)
     inside_mask = np.zeros_like(metal_mask, dtype=np.uint8)
