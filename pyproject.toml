@@ -5,12 +5,26 @@ description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
     "circle-fit>=0.2.1",
+    "duckdb>=1.5.5",
     "ipykernel>=7.2.0",
+    "k3d>=2.17.0",
+    "lightning>=2.6.5",
     "matplotlib>=3.10.9",
+    "numba>=0.66.0",
     "numpy>=2.4.6",
     "opencv-python>=4.13.0.92",
     "pandas>=3.0.3",
+    "pyarrow>=25.0.0",
     "scikit-image>=0.26.0",
     "scikit-learn>=1.9.0",
+    "scipy>=1.17.1",
+    "screeninfo>=0.8.1",
+    "torch>=2.13.0",
     "typer>=0.26.6",
+    "toml>=0.10.2",
+    "tqdm>=4.70.0",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"surfacing/enhance.py" = ["E402"]
+"surfacing/enhance.ipynb" = ["E402"]

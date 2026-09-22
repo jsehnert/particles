@@ -33,8 +33,8 @@ KEY_SAVE = ord("s")
 
 
 class GlobalData(AnalysisBase):
-    def __init__(self, cfg_path: Path, vol_file_name: str) -> None:
-        super().__init__(cfg_path, vol_file_name=vol_file_name)
+    def __init__(self, cfg_path: Path, vol_index: int) -> None:
+        super().__init__(cfg_path, vol_index=vol_index, exp_index=0)
 
 
 def _read_cells(cfg_path: Path) -> list[dict]:
@@ -63,12 +63,17 @@ def _write_cell_field(cfg_path: Path, index: int, field: str, new_value: int) ->
 def _normalize_image(img: NDArray) -> NDArray:
     """Normalize a 2D frame to 8-bit grayscale based on the grayscale range of the volume."""
     global global_data
-    gray_landmarks = global_data.grayscale_landmarks
-    air_grayvalue = gray_landmarks["air_grayvalue"]
-    metal_threshold = gray_landmarks["metal_threshold"]
-    max_grayvalue = gray_landmarks["max_grayvalue"]
-    upper_limit = max_grayvalue
-    img = (img.astype(float) - air_grayvalue) / (upper_limit - air_grayvalue)
+
+    try:
+        gray_landmarks = global_data.grayscale_landmarks
+        air_grayvalue = gray_landmarks["air_grayvalue"]
+        max_grayvalue = gray_landmarks["max_grayvalue"]
+        upper_limit = max_grayvalue
+        img = (img.astype(float) - air_grayvalue) / (upper_limit - air_grayvalue)
+    except Exception:
+        img = (img - img.min()) / (img.max() - img.min())
+        print("Global data is not properly initialized with grayscale landmarks.")
+
     img *= 255.0
     img = img.clip(0, 255).astype("uint8")
     return img
@@ -96,12 +101,14 @@ def main(
         cell = _read_cells(CONFIG_PATH)[index]
         name = cell["name"]
         z_value = int(cell[field])
-        vol_file_name = name + ".raw"
 
         typer.echo(f"Cell[{index}] = {name}  {field} = {z_value}")
-        typer.echo(f"Loading volume {vol_file_name}...")
-        global_data = GlobalData(CONFIG_PATH, vol_file_name=vol_file_name)
+        typer.echo(f"Loading volume for {name}...")
+        global_data = GlobalData(CONFIG_PATH, vol_index=index)
         vol = global_data.vol
+        if vol is None:
+            raise RuntimeError(f"Failed to load volume for {name}.")
+
         typer.echo(f"Volume shape: {vol.shape}")
 
         z_depth = vol.shape[0]
@@ -118,9 +125,10 @@ def main(
         # column directly off the memmap for the full volume is a maximally
         # strided access pattern that ends up faulting in nearly the whole
         # multi-GB file just to build a single column.
-        sub_vol = np.asarray(vol[crop_start:crop_end])
+        sub_vol = np.asarray(vol[crop_start:crop_end, :, :])
         mid_x = sub_vol.shape[2] // 2
-        display_slice = _normalize_image(sub_vol[:, :, mid_x])
+        mid_y = sub_vol.shape[1] // 2
+        display_slice = _normalize_image(sub_vol[:, mid_y, :])
 
         state["index"] = index
         state["name"] = name
@@ -130,7 +138,9 @@ def main(
         state["display_slice"] = display_slice
 
     def render() -> None:
-        img = cv2.cvtColor(state["display_slice"], cv2.COLOR_GRAY2BGR)
+        img = state["display_slice"]
+        print(f"Image shape: {img.shape}")
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         w = img.shape[1]
         line_y = state["z_value"] - state["crop_start"]
         cv2.line(img, (0, line_y), (w - 1, line_y), LINE_COLOR, LINE_THICKNESS)

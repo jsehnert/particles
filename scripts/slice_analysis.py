@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
+# **Notes**
+# - structural assymetry induces FP
+# -   metal tabs
+# -   a bend in the abode foil
+# -   unconstrained anodes in the core and near the periphery (can wall)
+# -   can tapering from the can wall below crimp region
 # TODO:
-#  - We need to get the enhancement to display properly.
-#  - Simply run a check on the residual image at the current location.
+#  -
 import csv
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
 from typing import cast
 
 import cv2
 import numpy as np
+import scipy
 import skimage
 import typer
 from numpy.typing import NDArray
@@ -73,10 +80,11 @@ class GlobalData(AnalysisBase):
         default_factory=lambda: np.array([], dtype=bool)
     )
 
-    def __init__(
-        self, cfg_path: Path = CONFIG_PATH, vol_file_name: str | None = None
-    ) -> None:
-        super().__init__(cfg_path=cfg_path, vol_file_name=vol_file_name)
+    def __init__(self, vol_index: int, cfg_path: Path = CONFIG_PATH) -> None:
+        super().__init__(cfg_path=cfg_path, vol_index=vol_index, exp_index=0)
+
+        if self.vol is None:
+            raise ValueError(f"Volume data is not loaded for index {vol_index}")
 
         shape = self.vol.shape
         hw = shape[1:]
@@ -99,7 +107,11 @@ class GlobalData(AnalysisBase):
         AnalysisBase.slab_thickness.fset(self, value)  # type: ignore
 
     def get_current_slice(self) -> NDArray[np.uint8]:
-        return self.vol[self.z_current]
+        return (
+            self.vol[self.z_current]
+            if self.vol is not None
+            else np.array([], dtype=np.uint8)
+        )
 
     def update_slice_location(self, z: int) -> None:
         """
@@ -377,7 +389,7 @@ class GlobalData(AnalysisBase):
             mask.astype(np.uint8), connectivity=8
         )
 
-        vol_path = Path(self.cfg["paths"]["vol_data_path"])
+        vol_path = self.vol_data_path
         out_dir = vol_path.parent / "particles"
         out_dir.mkdir(parents=True, exist_ok=True)
         fpath: Path = out_dir / (vol_path.stem + "_particles.csv")
@@ -435,6 +447,21 @@ global_data: GlobalData
 # Transient drag state for ROI drawing
 _drag: dict = {"active": False, "sx": 0, "sy": 0, "win": None}
 
+# Some OpenCV GUI backends do not emit EVENT_LBUTTONDBLCLK reliably. Keep enough
+# state to recognize a double-click from two nearby left-button presses as a fallback.
+_DOUBLE_CLICK_MAX_SECONDS = 0.4
+_DOUBLE_CLICK_MAX_DISTANCE_PX = 6
+_double_click: dict = {
+    "last_down_time": float("-inf"),
+    "last_down_x": 0,
+    "last_down_y": 0,
+    "last_down_win": None,
+    "last_dispatch_time": float("-inf"),
+    "last_dispatch_x": 0,
+    "last_dispatch_y": 0,
+    "last_dispatch_win": None,
+}
+
 """
 Observations:
 
@@ -479,6 +506,9 @@ KEYS_QUIT = {27, ord("q")}
 KEYS_ZOOM_IN = {ord("+"), ord("=")}
 KEYS_ZOOM_OUT = {ord("-"), ord("_")}
 KEYS_ZOOM_RESET = {ord("0")}
+KEYS_RECOGNIZED = (
+    KEYS_RIGHT | KEYS_LEFT | KEYS_QUIT | KEYS_ZOOM_IN | KEYS_ZOOM_OUT | KEYS_ZOOM_RESET
+)
 
 # There are large structural highlights that need to be suppressed
 
@@ -688,65 +718,111 @@ def _make_controls_callback(vol, state):
 
 _K3x3 = np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=np.uint8)
 
+mask_core: NDArray | None = None
+
 
 def create_enhancement() -> None:
     """
     Here we filter the residual image to create a rendering by:
-      - eliminating residuals that are below the dead zone threhold
+      - eliminating residuals that are below the dead zone threshold
       - eliminating connected regions of residuals that are below the area threshold
       - applying a mild blur to smooth out the speckle noise and make the particles more visible
     """
+    # Create a mask where pixels in the current slice survive the dead zon.
+    dead_zone_thresh = global_data.dead_zone_scale
 
     residual_cache = global_data._residual_cache
     residual_0, sigma_0 = residual_cache.get(global_data.z_current - 1, (None, None))
     residual_1, sigma_1 = residual_cache.get(global_data.z_current, (None, None))
     residual_2, sigma_2 = residual_cache.get(global_data.z_current + 1, (None, None))
 
+    # Carve out the core - which is right now a hack!
+    global mask_core
+    if mask_core is None:
+        w, h = residual_1.shape[1], residual_1.shape[0]
+        y, x = np.ogrid[:h, :w]
+        radius = 100
+        c_x, c_y = w / 2, h / 2
+        mask_core = (x - c_x) ** 2 + (y - c_y) ** 2 >= radius**2
+
+    global _auto_scrolling
+    if _auto_scrolling:
+        mask_check = residual_1 > dead_zone_thresh
+        mask_check &= mask_core
+        if not mask_check.any():
+            # Nothing in the current slice survives the dead zone threshold
+            global_data.display_enh = np.zeros_like(residual_1, dtype=np.float32)
+            global_data.n_particle_pixels = 0
+            return
+
+    if residual_0 is not None and residual_2 is not None:
+        residual_volume = np.stack([residual_0, residual_1, residual_2], axis=0)
+        mask_volume = residual_volume > dead_zone_thresh
+        kernel = np.ones((3, 3, 3), dtype=np.uint8)
+        neighbor_counts = scipy.ndimage.convolve(
+            mask_volume.astype(np.uint8), kernel, mode="constant", cval=0
+        )
+        middle_counts = neighbor_counts[1]
+        mask_cur = (
+            middle_counts > global_data.area_threshold
+        )  # Here we are interpreting the area threshold in 3D context
+        mask_cur &= mask_core
+        if not mask_cur.any():
+            global_data.display_enh = np.zeros_like(residual_1, dtype=np.float32)
+            global_data.n_particle_pixels = 0
+            return
+        # Project down the axis to pick up lateral shifting in adjacent regions
+        img = np.max(residual_volume, axis=0) * mask_cur
+    else:
+        residual_volume = None
+        mask_volume = None
+        mask_cur = None
+        img = None
+
     assert residual_1 is not None, "current residual not in cache"
 
-    # Create a mask where pixels in the current slice survive the dead zon.
-    dead_zone_thresh = global_data.dead_zone_scale
+    if img is None:
+        # Compute the mask for which the current slice is above the threshold dead zone. Clean the mask by removing small connected components below the area threshold.
+        mask_cur = (residual_1 > dead_zone_thresh) & mask_core
 
-    # Compute the mask for which the current slice is above the threshold dead zone. Clean the mask by removing small connected components below the area threshold.
-    mask_cur = residual_1 > dead_zone_thresh
+        # Now suppress small regions
+        labels = cv2.connectedComponents(mask_cur.astype(np.uint8), connectivity=8)[1]
+        if global_data.area_threshold > 1:
+            # Compute all component areas in one pass, then build a single mask
+            # of small regions to zero out.
+            areas = np.bincount(labels.ravel())
+            small_mask = areas < global_data.area_threshold
+            small_mask[0] = False  # background label is never "small"
+            mask_cur[small_mask[labels]] = 0
+            labels[small_mask[labels]] = 0  # zero out small regions in the label image
 
-    # Now suppress small regions
-    labels = cv2.connectedComponents(mask_cur.astype(np.uint8), connectivity=8)[1]
-    if global_data.area_threshold > 1:
-        # Compute all component areas in one pass, then build a single mask
-        # of small regions to zero out.
-        areas = np.bincount(labels.ravel())
-        small_mask = areas < global_data.area_threshold
-        small_mask[0] = False  # background label is never "small"
-        mask_cur[small_mask[labels]] = 0
-        labels[small_mask[labels]] = 0  # zero out small regions in the label image
+        # Now create the mask from the adjacent slices. Dilate so that we get diagonal connections as well.
+        mask_adj0 = np.ones_like(mask_cur, dtype=bool)
+        mask_adj2 = np.ones_like(mask_cur, dtype=bool)
+        if residual_0 is not None:
+            mask_adj0 &= residual_0 > dead_zone_thresh
+            mask_adj0 = skimage.morphology.dilation(mask_adj0, _K3x3)
+        if residual_2 is not None:
+            mask_adj2 &= residual_2 > dead_zone_thresh
+            mask_adj2 = skimage.morphology.dilation(mask_adj2, _K3x3)
 
-    # Now create the mask from the adjacent slices. Dilate so that we get diagonal connections as well.
-    mask_adj0 = np.ones_like(mask_cur, dtype=bool)
-    mask_adj2 = np.ones_like(mask_cur, dtype=bool)
-    if residual_0 is not None:
-        mask_adj0 &= residual_0 > dead_zone_thresh
-        mask_adj0 = skimage.morphology.dilation(mask_adj0, _K3x3)
-    if residual_2 is not None:
-        mask_adj2 &= residual_2 > dead_zone_thresh
-        mask_adj2 = skimage.morphology.dilation(mask_adj2, _K3x3)
+        # Use the adjacent masks to filter the current mask, leaving only those regions in the current slice that are connected to one of the adjacent masks.
+        intersecting = np.unique(labels[mask_adj0 | mask_adj2])
+        intersecting = intersecting[intersecting > 0]  # remove background label
+        mask_cur = np.isin(labels, intersecting)
 
-    # Use the adjacent masks to filter the current mask, leaving only those regions in the current slice that are connected to one of the adjacent masks.
-    intersecting = np.unique(labels[mask_adj0 | mask_adj2])
-    intersecting = intersecting[intersecting > 0]  # remove background label
-    mask_cur = np.isin(labels, intersecting)
+        img = cast(
+            NDArray[np.float32], np.where(mask_cur, residual_1, 0.0).astype(np.float32)
+        )
 
-    img = cast(
-        NDArray[np.float32], np.where(mask_cur, residual_1, 0.0).astype(np.float32)
-    )
-    blur_size = 5
+    blur_size = 21
     if blur_size > 1:
         scale = img.max()
         img = cast(
             NDArray[np.float32], cv2.GaussianBlur(img, (blur_size, blur_size), 0)
         )
         scale /= max(img.max(), 1e-6) * dead_zone_thresh
-        img *= np.float32(scale)
+        img *= np.float32(scale) * mask_cur
     img = cast(
         NDArray[np.float32],
         cv2.resize(img, (DISPLAY_PX, DISPLAY_PX), interpolation=ENH_INTERP),
@@ -760,6 +836,7 @@ def create_enhancement() -> None:
     global_data.n_particle_pixels = n_residual_pixels
     if n_residual_pixels > 0:
         global_data.record_particles(mask_cur, residual_1, global_data.z_current)
+
     global_data.display_enh = cast(NDArray[np.float32], img)  # .astype(np.uint8)
 
 
@@ -901,7 +978,7 @@ def _overlay_roi(img: NDArray[np.uint8]) -> NDArray[np.uint8]:
     if global_data.roi is None or not global_data.display_slice.size:
         return out
     # Map ROI image coords → display coords, accounting for zoom
-    img_h, img_w = global_data.display_slice.shape[:2]
+    img_h, img_w = global_data.vol.shape[1:]
     h, w = img.shape[:2]
     vx1, vy1, crop_w, crop_h = _zoom_window(w, h)
 
@@ -946,9 +1023,12 @@ def _redraw_images() -> None:
         round(cx_px * global_data.vol.shape[2] / img_w),
         round(cy_px * global_data.vol.shape[1] / img_h),
     )
+    cx = int(np.clip(cx, 0, global_data.vol.shape[2] - 1))
+    cy = int(np.clip(cy, 0, global_data.vol.shape[1] - 1))
+    gray_level = global_data.vol[z, cy, cx]
     sub_label = (
         f"[z={z}, {z * global_data.voxel_size_mm:.2f}mm]"
-        f"  center=({cx}, {cy}){roi_suffix}"
+        f"  center=({cx}, {cy}), gray_level={gray_level}{roi_suffix}"
     )
     if global_data.display_slice.size:
         cv2.setWindowTitle(WIN_SLICE, f"Slice {sub_label}")
@@ -963,17 +1043,116 @@ def _redraw_images() -> None:
         cv2.setWindowTitle(WIN_STATS, f"Noise Statistics  {sub_label}")
 
 
+def on_mouse_doubleclick(
+    *,
+    event: int,
+    display_x: int,
+    display_y: int,
+    image_x: int,
+    image_y: int,
+    flags: int,
+    window_name: str,
+    z: int,
+) -> None:
+    """Handle a left-button double-click in one of the image windows.
+
+    The clicked ``(y, x)`` coordinate is refined to the lateral location of the
+    maximum raw-volume value in the surrounding 3 × 3 × 3 neighborhood. The
+    displayed z-slice is not changed.
+
+    Args:
+        event: OpenCV mouse event code (``cv2.EVENT_LBUTTONDBLCLK``).
+        display_x: Horizontal click coordinate in the displayed window.
+        display_y: Vertical click coordinate in the displayed window.
+        image_x: Horizontal coordinate mapped into the source image.
+        image_y: Vertical coordinate mapped into the source image.
+        flags: OpenCV mouse-event flags active at the time of the click.
+        window_name: Name of the OpenCV window that received the click.
+        z: Volume slice displayed when the click occurred.
+    """
+    clicked_x, clicked_y = image_x, image_y
+    z1, z2 = max(0, z - 1), min(global_data.vol.shape[0], z + 2)
+    y1, y2 = max(0, image_y - 1), min(global_data.vol.shape[1], image_y + 2)
+    x1, x2 = max(0, image_x - 1), min(global_data.vol.shape[2], image_x + 2)
+
+    neighborhood = global_data.vol[z1:z2, y1:y2, x1:x2]
+    local_z, local_y, local_x = np.unravel_index(
+        int(np.argmax(neighborhood)), neighborhood.shape
+    )
+    max_z = z1 + int(local_z)
+    image_y = y1 + int(local_y)
+    image_x = x1 + int(local_x)
+
+    global_data.zoom_cx = image_x / global_data.vol.shape[2]
+    global_data.zoom_cy = image_y / global_data.vol.shape[1]
+    gray_level = global_data.vol[z, image_y, image_x]
+    max_gray_level = global_data.vol[max_z, image_y, image_x]
+    print(
+        f"Double-click at display=({display_x}, {display_y}), "
+        f"clicked_image=({clicked_x}, {clicked_y}), "
+        f"refined_image=({image_x}, {image_y}), z={z}, max_z={max_z}, "
+        f"gray_level={gray_level}, max_gray_level={max_gray_level}"
+    )
+    _redraw_images()
+
+
 def _make_mouse_callback():
     """Return a single mouse callback shared across all 3 image windows.
 
-    Left-drag  : draw ROI rectangle (shown on all windows live).
-    Right-click: set zoom center.
+    Left-drag       : draw ROI rectangle (shown on all windows live).
+    Left-doubleclick: call ``on_mouse_doubleclick`` with mapped coordinates.
+    Right-click     : set zoom center.
     """
+
+    def _dispatch_doubleclick(
+        event: int,
+        x: int,
+        y: int,
+        ix: int,
+        iy: int,
+        flags: int,
+        window_name: str,
+    ) -> None:
+        """Dispatch one double-click and suppress duplicate native events."""
+        now = monotonic()
+        recently_dispatched = (
+            now - _double_click["last_dispatch_time"] < 0.1
+            and window_name == _double_click["last_dispatch_win"]
+            and abs(x - _double_click["last_dispatch_x"])
+            <= _DOUBLE_CLICK_MAX_DISTANCE_PX
+            and abs(y - _double_click["last_dispatch_y"])
+            <= _DOUBLE_CLICK_MAX_DISTANCE_PX
+        )
+        if recently_dispatched:
+            return
+
+        _double_click["last_dispatch_time"] = now
+        _double_click["last_dispatch_x"] = x
+        _double_click["last_dispatch_y"] = y
+        _double_click["last_dispatch_win"] = window_name
+        _double_click["last_down_time"] = float("-inf")
+
+        # A double-click may arrive while the first click's drag state is still
+        # active. Clear it so the gesture cannot leave behind a stale ROI drag.
+        _drag["active"] = False
+        _drag["win"] = None
+        on_mouse_doubleclick(
+            event=event,
+            display_x=x,
+            display_y=y,
+            image_x=ix,
+            image_y=iy,
+            flags=flags,
+            window_name=window_name,
+            z=global_data.z_current,
+        )
 
     def _cb(event: int, x: int, y: int, flags: int, param) -> None:
         if not global_data.display_slice.size:
             return
-        img_h, img_w = global_data.display_slice.shape[:2]
+        # Use the native volume dimensions for returned image coordinates. The
+        # display slice has already been resized to DISPLAY_PX × DISPLAY_PX.
+        img_h, img_w = global_data.vol.shape[1:]
         # Map screen position → image coords using the same crop window as _apply_zoom
         h = w = DISPLAY_PX
         vx1, vy1, crop_w, crop_h = _zoom_window(w, h)
@@ -983,11 +1162,32 @@ def _make_mouse_callback():
         ix = max(0, min(img_w - 1, ix))
         iy = max(0, min(img_h - 1, iy))
 
-        if event == cv2.EVENT_LBUTTONDOWN:
-            _drag["active"] = True
-            _drag["sx"] = ix
-            _drag["sy"] = iy
-            _drag["win"] = param  # remember which window started the drag
+        if event == cv2.EVENT_LBUTTONDBLCLK:
+            _dispatch_doubleclick(event, x, y, ix, iy, flags, str(param))
+        elif event == cv2.EVENT_LBUTTONDOWN:
+            now = monotonic()
+            is_fallback_doubleclick = (
+                now - _double_click["last_down_time"] <= _DOUBLE_CLICK_MAX_SECONDS
+                and param == _double_click["last_down_win"]
+                and abs(x - _double_click["last_down_x"])
+                <= _DOUBLE_CLICK_MAX_DISTANCE_PX
+                and abs(y - _double_click["last_down_y"])
+                <= _DOUBLE_CLICK_MAX_DISTANCE_PX
+            )
+            _double_click["last_down_time"] = now
+            _double_click["last_down_x"] = x
+            _double_click["last_down_y"] = y
+            _double_click["last_down_win"] = param
+
+            if is_fallback_doubleclick:
+                _dispatch_doubleclick(
+                    cv2.EVENT_LBUTTONDBLCLK, x, y, ix, iy, flags, str(param)
+                )
+            else:
+                _drag["active"] = True
+                _drag["sx"] = ix
+                _drag["sy"] = iy
+                _drag["win"] = param  # remember which window started the drag
         elif event == cv2.EVENT_LBUTTONUP:
             if not _drag["active"]:
                 return
@@ -1063,41 +1263,13 @@ def update_windows() -> None:
 app = typer.Typer()
 
 
-def _resolve_data_path(filename: str | None, cfg: dict) -> Path:
-    if filename:
-        filename_path = Path(filename)
-        if filename_path.is_absolute():
-            return filename_path
-        if filename_path.parent == Path("."):
-            return PROJECT_ROOT / "Data" / filename_path
-        return PROJECT_ROOT / filename_path
-
-    configured_path = cfg.get("paths", {}).get("vol_data")
-    if not configured_path:
-        typer.echo(
-            "Error: no filename provided and paths.vol_data is missing.", err=True
-        )
-        raise typer.Exit(1)
-
-    data_path = Path(configured_path)
-    if data_path.is_absolute():
-        return data_path
-
-    candidates = [
-        PROJECT_ROOT / data_path,
-        Path.cwd() / data_path,
-        Path(__file__).resolve().parent / data_path,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    return candidates[0]
-
-
-def _init_globals(vol_file_name: str | None = None) -> None:
+def _init_globals(vol_index: int) -> None:
     global global_data
-    global_data = GlobalData(vol_file_name=vol_file_name)
+    global_data = GlobalData(vol_index=vol_index)
+    if global_data.vol is None:
+        raise ValueError("Failed to load volume data")
+    else:
+        print(f"\n\n    ****Loaded volume {global_data.cfg['cell'][vol_index]}")
 
     typer.echo("Volume shape: %s" % (global_data.vol.shape,))
     typer.echo("Computing grayscale landmarks...")
@@ -1107,8 +1279,8 @@ def _init_globals(vol_file_name: str | None = None) -> None:
     )
     metal_threshold = estimate_metal_threshold(
         global_data.vol[z0 : z1 + 1],
-        air_grayvalue,
         slice_step=global_data.grayscale_slice_step,
+        offset_percentile=global_data.metal_offset_percentile,
     )
 
     typer.echo("Estimating global noise...")
@@ -1117,9 +1289,11 @@ def _init_globals(vol_file_name: str | None = None) -> None:
         slice_levels.append(z1 - 1)
     global_stats = estimate_volume_slice_stats(
         global_data.vol[z0:z1],
-        slice_levels,
-        global_data.noise_clip_scale,
+        slice_levels=slice_levels,
+        trunc_k=global_data.noise_clip_scale,
         metal_threshold=metal_threshold,
+        min_area=global_data.metal_min_area,
+        grayscale_metal_margin=global_data.metal_grayscale_margin,
     )
 
     global_stats["air_grayvalue"] = air_grayvalue
@@ -1137,14 +1311,32 @@ def _init_globals(vol_file_name: str | None = None) -> None:
     global_data.global_stats = global_stats
 
 
-@app.command()
-def main(
-    filename: str | None = typer.Argument(
-        None,
-        help="Optional volume filename inside ./Data/. Defaults to paths.vol_data_path in config.toml.",
-    ),
+_auto_scrolling: bool = False
+_shutdown_requested: bool = False
+
+
+def _handle_callback_interrupt(callback):
+    """Convert Ctrl-C in an OpenCV callback into a main-loop shutdown request."""
+
+    def wrapped(*args) -> None:
+        global _shutdown_requested
+        try:
+            callback(*args)
+        except KeyboardInterrupt:
+            # OpenCV swallows callback exceptions after printing their traceback, so
+            # they cannot reach main()'s try/finally block directly.
+            _shutdown_requested = True
+            typer.echo("KeyboardInterrupt received, closing GUI...")
+
+    return wrapped
+
+
+def _run_main(
+    vol_index: int = typer.Argument(..., help="Index into the config's [[cell]] array"),
 ) -> None:
-    _init_globals(filename)
+    global _auto_scrolling, _shutdown_requested
+    _shutdown_requested = False
+    _init_globals(vol_index)
     # global_data.z_min = 3554
     state: dict[str, int] = {"z": global_data.z_min}
 
@@ -1155,10 +1347,8 @@ def main(
         "Use the slider or A/D keys to navigate through slices. Press Q to quit."
     )
 
-    _auto_scrolling = False
-
     def on_trackbar(pos: int) -> None:
-        nonlocal _auto_scrolling
+        global _auto_scrolling
         if _auto_scrolling:
             return  # ignore re-entrant call from setTrackbarPos
 
@@ -1171,7 +1361,7 @@ def main(
         if global_data.auto_scroll:
             # Advance through slices until we find one with particles
             typer.echo(f"Auto-scrolling: starting at z={new_z}...")
-            while global_data.n_particle_pixels <= 100000 and new_z < global_data.z_max:
+            while global_data.n_particle_pixels < 1 and new_z < global_data.z_max:
                 new_z += 1
                 typer.echo(f"    ...Auto-scrolling: z={new_z}")
                 global_data.update_slice_location(new_z)
@@ -1189,24 +1379,35 @@ def main(
 
     _cb = _make_mouse_callback()
     for win in (WIN_SLICE, WIN_MAXPROJ, WIN_ENH):
-        cv2.setMouseCallback(win, _cb, param=win)
+        cv2.setMouseCallback(win, _handle_callback_interrupt(_cb), param=win)
 
     cv2.imshow(WIN_CONTROLS, render_controls_panel())
     cv2.resizeWindow(WIN_CONTROLS, CTRL_W, CTRL_H)
     cv2.setWindowProperty(WIN_CONTROLS, cv2.WND_PROP_TOPMOST, 1)
-    cv2.setMouseCallback(WIN_CONTROLS, _make_controls_callback(global_data.vol, state))
+    cv2.setMouseCallback(
+        WIN_CONTROLS,
+        _handle_callback_interrupt(_make_controls_callback(global_data.vol, state)),
+    )
 
     z0 = global_data.z_min
     z1 = global_data.z_max
-    cv2.createTrackbar("z", WIN_SLICE, 0, z1 - z0, on_trackbar)
+    cv2.createTrackbar(
+        "z", WIN_SLICE, 0, z1 - z0, _handle_callback_interrupt(on_trackbar)
+    )
 
     cv2.moveWindow(WIN_STATS, 1500, 50)
     cv2.moveWindow(WIN_ENH, 50, 50)
 
     while True:
         key: int = cv2.waitKey(20)
-        # Reset stuck drag state on any key press (handles missed LBUTTONUP)
-        if key != -1 and _drag["active"]:
+        if _shutdown_requested:
+            break
+        # Reset stuck drag state on a recognized key press (handles missed LBUTTONUP).
+        # Only recognized keys qualify — cv2.waitKey() on macOS's Cocoa backend can
+        # return spurious non-(-1) codes from window-repaint/focus events fired by
+        # the imshow() calls in _redraw_images() during a drag, and treating those
+        # as "a key was pressed" was killing in-progress drags mid-gesture.
+        if key in KEYS_RECOGNIZED and _drag["active"]:
             _drag["active"] = False
             _drag["win"] = None
         if key in KEYS_QUIT:
@@ -1232,7 +1433,20 @@ def main(
             global_data.roi = None
             _redraw_images()
 
-    cv2.destroyAllWindows()
+
+@app.command()
+def main(
+    vol_index: int = typer.Argument(..., help="Index into the config's [[cell]] array"),
+) -> None:
+    """Run the GUI and always release its native OpenCV windows on exit."""
+    try:
+        _run_main(vol_index)
+    except KeyboardInterrupt:
+        typer.echo("KeyboardInterrupt received, exiting...")
+    finally:
+        cv2.destroyAllWindows()
+        # Cocoa needs one event-loop pass to process the window-close request.
+        cv2.waitKey(10)
 
 
 if __name__ == "__main__":
