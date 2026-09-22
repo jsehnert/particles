@@ -1,152 +1,567 @@
 [paths]
-vol_data_path = "/Users/jim/Documents/GitHub/particles/Data/M50L-21.raw"
-
-[vol_info]
-voxel_size = 0.01640435
+vol_data_dir = "/Users/jim/Documents/GitHub/particles/Data/volumes"
 
 [analysis]
-slab_thickness = 11
+slab_thickness = 25
 baseline_method = "median" #Baseline estimate method 'median' or 'mean'
-vol_top = 200
-vol_bottom = 4060
 
 # Slice-by-slice analysis parameters
-dead_zone_scale = 4.0 # resisual dead zone scale in units of sigma
-area_threshold = 2 # Minimum area for connected components in the particle slice mask
+dead_zone_scale = 4.2 # resisual dead zone scale in units of sigma
+area_threshold = 3 # Minimum area for connected components in the particle slice mask
 
 # Full volume analysis parameters
-slices_per_chunk = 256 # Number of slices to process in one chunk
-z_extent_max = 16 # Longest admissible axial extent of a candidate in slices
-vol_threshold = 3 # minimu volume for connected components in the particle volume mask
-high_threshold_scale = 4.2 # High threshold for candidate dections (scales sigma)
-low_threshold_scale = 3.0 # Low threshold for candidate growth (scales sigma)
-aniso_factor = 1.2 # Controls the z_extent relative to the lateral extent for a particle. Values < 1.0 are more restrictive, values > 1.0 are more permissive. A value of 1.0 is a good starting point for most cases. Regardless, clipping is applied to the z_extent_max to prevent unreasonably long candidates from being accepted. The default of 1.0 is a good starting point for most cases.
-small_vol_cutoff = 5 # Minimum number of voxels for valid candidates with small z_extent
-z_pad = 2 # Additional slop factor for the z_extent test to prevent integer roundoff from clipping borderline mid-size blobs.
-small_z_bounds = [1, 4] # Inclusive z_extent bounds for small components
+slices_per_chunk = 64 # Number of slices to process for candidates in one chunk
+n_workers = 7 # Number of workers to use for candidate extraction
+storage_margin = 3 # Per-side voxel-dump bbox padding (voxels); must be >= shell_radius
+shell_radius = 3 # Shell radius for edge_contrast/decay_drop/grayscale features (voxels)
+# Recall-first research default: skip the shape-discrimination gate (_axial_ok:
+# anisotropy, min_fill, small-regime routing, z_lo) and defer shape rejection to the
+# downstream classifier. Only min_seed_voxels and z_extent_max still gate. Set true to
+# re-enable the shape gates. Shape params below remain configured but inert when false.
+enforce_shape_gates = false
+
+preprocess_slices_per_chunk = 512 # Number of slices to preprocess in one chunk
+preprocess_n_workers = 12 # Number of workers to use for preprocessing
 
 [noise]
 clip_scale = 2.5 #Clipping performed when estimating the gaussian noise
 slice_step = 50 #Step size for sampling slices when estimating noise statistics across the volume
 
 [metal]
-gray_margin = 20 #Grayscale margin allowed to grow into
-min_area = 200   #Minimum area of metal mask components
+metal_offset_percentile = 40
+gray_margin = 20  # uint8 grayscale delta for metal-mask hysteresis (low = threshold - margin); NOT spatial
+# Physical area so the metal min-area is resolution-independent across cell formats.
+# Converted to a pixel count at runtime with the per-cell voxel_size (see cfg_data.py).
+# At voxel_size=0.01640435mm this reproduces the historical 200 px value.
+min_area_mm2 = 0.053820539784500014  # Minimum area of metal mask components (was 200 px)
 
 [grayscale_landmarks]
 slice_step = 200 #Step size for sampling slices when estimating grayscale landmarks across the volume
 
-[[cell]]
-name = "M50L-01"
-z_min = 205
-z_max = 4067
+
+# [[experiment]]
+# experiment_number = 0
+# slab_thickness = 11
+# high_threshold_scale = 4.2
+# low_threshold_scale = 2.5
+# baseline_method = "median"
+# max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+# min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+# aniso_factor = 1.2 # Controls the z_extent relative to lateral extent for a candidate, clipped to z_extent_max.
+# small_vol_cutoff = 5 # cuttoff vol separating small candidates
+# z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+# small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+# [[experiment]]
+# experiment_number = 1
+# slab_thickness = 11
+# high_threshold_scale = 4.2
+# low_threshold_scale = 2.75
+# baseline_method = "median"
+# max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+# min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+# aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+# small_vol_cutoff = 5 # cuttoff vol separating small candidates
+# z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+# small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+# [[experiment]]
+# experiment_number = 2
+# slab_thickness = 11
+# high_threshold_scale = 4.2
+# low_threshold_scale = 3.0
+# baseline_method = "median"
+# max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+# min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+# aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+# small_vol_cutoff = 5 # cuttoff vol separating small candidates
+# z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+# small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+# [[experiment]]
+# experiment_number = 3
+# slab_thickness = 15 #Based on max extent of 240 um
+# high_threshold_scale = 4.2
+# low_threshold_scale = 2.5
+# baseline_method = "median"
+# max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+# min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+# aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+# small_vol_cutoff = 5 # cuttoff vol separating small candidates
+# z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+# small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+# [[experiment]]
+# experiment_number = 4
+# slab_thickness = 15 #Based on max extent of 240 um
+# high_threshold_scale = 4.2
+# low_threshold_scale = 2.75
+# baseline_method = "median"
+# max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+# min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+# aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+# small_vol_cutoff = 5 # cuttoff vol separating small candidates
+# z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+# small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+# [[experiment]]
+# experiment_number = 5
+# slab_thickness = 15 #Based on max extent of 240 um
+# high_threshold_scale = 4.2
+# low_threshold_scale = 3.0
+# baseline_method = "median"
+# max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+# min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+# aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+# small_vol_cutoff = 5 # cuttoff vol separating small candidates
+# z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+# small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 6
+slab_thickness = 21
+high_threshold_scale = 4.2
+low_threshold_scale = 2.5
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 7
+slab_thickness = 21
+high_threshold_scale = 4.2
+low_threshold_scale = 2.75
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 8
+slab_thickness = 21
+high_threshold_scale = 4.2
+low_threshold_scale = 3.0
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 9
+slab_thickness = 25 #Based on max extent of 240 um
+high_threshold_scale = 4.2
+low_threshold_scale = 2.5
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 10
+slab_thickness = 25 #Based on max extent of 240 um
+high_threshold_scale = 4.2
+low_threshold_scale = 2.75
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 11
+slab_thickness = 25 #Based on max extent of 240 um
+high_threshold_scale = 4.2
+low_threshold_scale = 3.0
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 12
+slab_thickness = 31
+high_threshold_scale = 4.2
+low_threshold_scale = 2.5
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 13
+slab_thickness = 31
+high_threshold_scale = 4.2
+low_threshold_scale = 2.75
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 14
+slab_thickness = 31
+high_threshold_scale = 4.2
+low_threshold_scale = 3.0
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 15
+slab_thickness = 23
+high_threshold_scale = 4.2
+low_threshold_scale = 2.5
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 16
+slab_thickness = 23
+high_threshold_scale = 4.2
+low_threshold_scale = 2.75
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 17
+slab_thickness = 23
+high_threshold_scale = 4.2
+low_threshold_scale = 3.0
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 18
+slab_thickness = 23
+high_threshold_scale = 4.2
+low_threshold_scale = 3.25
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
+
+[[experiment]]
+experiment_number = 19
+slab_thickness = 23
+high_threshold_scale = 4.2
+low_threshold_scale = 3.5
+baseline_method = "median"
+max_axial_extent_mm = 0.262 # Longest admissible axial extent of a candidate (physical; -> ceil(mm/voxel_size) slices)
+min_seed_voxels = 3 # min connected seed voxels above k_high (noise-collapse floor; sensitivity-first, FP left to classifier)
+aniso_factor = 1.2 # Controls the z extent relative to lateral extent for a candidate, clipped to z_extent_max.
+small_vol_cutoff = 5 # cuttoff vol separating small candidates
+z_pad = 2 # Anisotropy-gate slack in VOXELS (round-off guard); intrinsically per-voxel, do NOT scale by voxel_size
+small_z_bounds = [1, 4] # Inclusive z extent bounds for small components
 
 [[cell]]
-name = "M50L-02"
-z_min = 202
-z_max = 4063
+name = "M50L-01_processed"
+z_min = 144
+z_max = 4014
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
 
 [[cell]]
-name = "M50L-03"
-z_min = 200
-z_max = 4065
+name = "M50L-02_processed"
+z_min = 138
+z_max = 4012
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
 
 [[cell]]
-name = "M50L-04"
-z_min = 207
-z_max = 4064
+name = "M50L-03_processed"
+z_min = 140
+z_max = 4012
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
 
 [[cell]]
-name = "M50L-05"
-z_min = 204
-z_max = 4060
+name = "M50L-04_processed"
+z_min = 144
+z_max = 4014
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
 
+[[cell]]
+name = "M50L-05_processed"
+z_min = 144
+z_max = 4012
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-06_processed"
+z_min = 136
+z_max = 4016
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-07_processed"
+z_min = 130
+z_max = 4010
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-08_processed"
+z_min = 134
+z_max = 4004
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-09_processed"
+z_min = 134
+z_max = 4012
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-10_processed"
+z_min = 134
+z_max = 4014
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-11_processed"
+z_min = 130
+z_max = 4000
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-12_processed"
+z_min = 126
+z_max = 4007
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-13_processed"
+z_min = 146
+z_max = 4020
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-14_processed"
+z_min = 130
+z_max = 4008
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-15_processed"
+z_min = 144
+z_max = 4008
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-16_processed"
+z_min = 152
+z_max = 4010
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-17_processed"
+z_min = 150
+z_max = 3998
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-18_processed"
+z_min = 152
+z_max = 3996
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-19_processed"
+z_min = 150
+z_max = 4014
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-20_processed"
+z_min = 154
+z_max = 3998
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-21_processed"
+z_min = 156
+z_max = 4006
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-22_processed"
+z_min = 154
+z_max = 4006
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+[[cell]]
+name = "M50L-23_processed"
+z_min = 154
+z_max = 4006
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1340
+voxels_y = 1340
+
+#
+# The cells below here are for experimental purposes only
+#
 [[cell]]
 name = "M50L-06"
-z_min = 200
-z_max = 4066
-
-[[cell]]
-name = "M50L-07"
-z_min = 195
-z_max = 4060
-
-[[cell]]
-name = "M50L-08"
-z_min = 210
-z_max = 4071
-
-[[cell]]
-name = "M50L-09"
-z_min = 212
-z_max = 4073
-
-[[cell]]
-name = "M50L-10"
-z_min = 213
-z_max = 4077
-
-[[cell]]
-name = "M50L-11"
-z_min = 207
-z_max = 4067
-
-[[cell]]
-name = "M50L-12"
-z_min = 206
-z_max = 4071
-
-[[cell]]
-name = "M50L-13"
-z_min = 223
-z_max = 4084
-
-[[cell]]
-name = "M50L-14"
-z_min = 206
-z_max = 4073
-
-[[cell]]
-name = "M50L-15"
-z_min = 231
-z_max = 4083
-
-[[cell]]
-name = "M50L-16"
-z_min = 240
-z_max = 4089
-
-[[cell]]
-name = "M50L-17"
-z_min = 238
-z_max = 4076
-
-[[cell]]
-name = "M50L-18"
-z_min = 243
-z_max = 4075
-
-[[cell]]
-name = "M50L-19"
-z_min = 238
-z_max = 4092
-
-[[cell]]
-name = "M50L-20"
-z_min = 243
-z_max = 4075
-
-[[cell]]
-name = "M50L-21"
-z_min = 246
-z_max = 4084
-
-[[cell]]
-name = "M50L-22"
-z_min = 245
-z_max = 4084
-
-[[cell]]
-name = "M50L-23"
-z_min = 246
-z_max = 4085
+z_min = 194
+z_max = 4072
+voxel_size = 0.01640435
+form_factor = "2170"  # nominal 21mm diameter x 70mm height cylindrical cell
+nominal_diameter_mm = 21.0
+nominal_height_mm = 70.0
+voxels_x = 1425
+voxels_y = 1425
