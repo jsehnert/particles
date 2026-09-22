@@ -4,6 +4,15 @@
 # Python environment
 .venv/
 
+# Generated Python and numerical-computing caches
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+
+# Local agent settings
+.claude/
+
 # Data files
 *.vol
 
