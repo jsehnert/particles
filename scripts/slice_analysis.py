@@ -11,7 +11,6 @@ import csv
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from time import monotonic
 from typing import cast
 
 import cv2
@@ -23,6 +22,8 @@ from numpy.typing import NDArray
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PROJECT_ROOT / "config.toml"
+PARTICLES_FOUND_PATH = PROJECT_ROOT / "Data" / "particles_found.csv"
+PARTICLES_FOUND_FIELDS = ("volume_name", "x", "y", "z", "gray_level")
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from cfg_data import AnalysisBase  # noqa: E402
@@ -37,6 +38,30 @@ from noise import (  # noqa: E402
     leavein_median_noise_scale_penta,
 )
 from utils import estimate_grayscale_range, identify_cylindrical_support  # noqa: E402
+
+
+def _load_particles_found() -> list[dict[str, str]]:
+    """Load previously recorded particle locations, creating the CSV if needed."""
+    PARTICLES_FOUND_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not PARTICLES_FOUND_PATH.exists():
+        with PARTICLES_FOUND_PATH.open("w", newline="") as csv_file:
+            csv.DictWriter(csv_file, fieldnames=PARTICLES_FOUND_FIELDS).writeheader()
+        return []
+
+    with PARTICLES_FOUND_PATH.open(newline="") as csv_file:
+        return list(csv.DictReader(csv_file))
+
+
+particles_found = _load_particles_found()
+particles_found_keys = {
+    (
+        row.get("volume_name", ""),
+        row.get("x", ""),
+        row.get("y", ""),
+        row.get("z", ""),
+    )
+    for row in particles_found
+}
 
 
 @dataclass
@@ -447,20 +472,70 @@ global_data: GlobalData
 # Transient drag state for ROI drawing
 _drag: dict = {"active": False, "sx": 0, "sy": 0, "win": None}
 
-# Some OpenCV GUI backends do not emit EVENT_LBUTTONDBLCLK reliably. Keep enough
-# state to recognize a double-click from two nearby left-button presses as a fallback.
-_DOUBLE_CLICK_MAX_SECONDS = 0.4
-_DOUBLE_CLICK_MAX_DISTANCE_PX = 6
-_double_click: dict = {
-    "last_down_time": float("-inf"),
-    "last_down_x": 0,
-    "last_down_y": 0,
-    "last_down_win": None,
-    "last_dispatch_time": float("-inf"),
-    "last_dispatch_x": 0,
-    "last_dispatch_y": 0,
-    "last_dispatch_win": None,
-}
+# A single click creates a pending selection. It is written to the CSV only
+# when the user confirms it with the ``r`` key.
+pending_particle_z_max: int | None = None
+pending_particle_y: int | None = None
+pending_particle_x: int | None = None
+last_click_info: dict[str, int] | None = None
+
+
+def _clear_pending_particle() -> None:
+    """Clear the particle selection awaiting confirmation."""
+    global pending_particle_z_max, pending_particle_y, pending_particle_x
+    pending_particle_z_max = None
+    pending_particle_y = None
+    pending_particle_x = None
+
+
+def _record_particle_found(*, x: int, y: int, z: int, gray_level: int) -> None:
+    """Append one refined particle location to the project-level CSV.
+
+    ``x`` is the image column and ``y`` is the image row, matching NumPy's
+    ``volume[z, row, column]`` indexing convention. A refined coordinate is
+    recorded at most once for each volume.
+    """
+    row = {
+        "volume_name": global_data.vol_data_path.name,
+        "x": str(x),
+        "y": str(y),
+        "z": str(z),
+        "gray_level": str(gray_level),
+    }
+    key = (row["volume_name"], row["x"], row["y"], row["z"])
+    if key in particles_found_keys:
+        return
+
+    particles_found_keys.add(key)
+    particles_found.append(row)
+    with PARTICLES_FOUND_PATH.open("a", newline="") as csv_file:
+        csv.DictWriter(csv_file, fieldnames=PARTICLES_FOUND_FIELDS).writerow(row)
+
+
+def _record_pending_particle() -> None:
+    """Record the pending selection, or report that none is available."""
+    if (
+        pending_particle_z_max is None
+        or pending_particle_y is None
+        or pending_particle_x is None
+    ):
+        typer.echo("No pending particle selection.")
+        return
+
+    gray_level = int(
+        global_data.vol[
+            pending_particle_z_max,
+            pending_particle_y,
+            pending_particle_x,
+        ]
+    )
+    _record_particle_found(
+        x=pending_particle_x,
+        y=pending_particle_y,
+        z=pending_particle_z_max,
+        gray_level=gray_level,
+    )
+
 
 """
 Observations:
@@ -491,13 +566,13 @@ Options to explore:
 WIN_SLICE = "Slice"
 WIN_MAXPROJ = "Max Projection"
 WIN_ENH = "Enhancement"
-WIN_STATS = "Noise Statistics"
+WIN_STATS = "Info"
 WIN_CONTROLS = "Controls"
 
 DISPLAY_PX = 1200
 ENH_INTERP = cv2.INTER_NEAREST
 
-HIST_W, HIST_H = 600, 450
+HIST_W, HIST_H = 600, 620
 PAD_L, PAD_R, PAD_T, PAD_B = 70, 20, 40, 60
 
 KEYS_RIGHT = {83, 3, 63235, ord("d")}
@@ -815,7 +890,7 @@ def create_enhancement() -> None:
             NDArray[np.float32], np.where(mask_cur, residual_1, 0.0).astype(np.float32)
         )
 
-    blur_size = 21
+    blur_size = 3
     if blur_size > 1:
         scale = img.max()
         img = cast(
@@ -941,6 +1016,51 @@ def render_noise_stats(local_stats: dict, global_stats: dict) -> NDArray[np.uint
         mid_x + 24,
     )
 
+    info_y = HIST_H - 175
+    cv2.line(canvas, (24, info_y), (HIST_W - 24, info_y), (90, 90, 90), 1)
+    cv2.putText(
+        canvas,
+        "Last click",
+        (24, info_y + 32),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (210, 210, 210),
+        1,
+        cv2.LINE_AA,
+    )
+    if last_click_info is None:
+        info_lines = ["No click selection"]
+    else:
+        info_lines = [
+            (
+                "clicked: "
+                f"display=({last_click_info['display_x']}, "
+                f"{last_click_info['display_y']}), "
+                f"location=(z={last_click_info['clicked_z']}, "
+                f"row={last_click_info['clicked_y']}, "
+                f"col={last_click_info['clicked_x']}), "
+                f"gray={last_click_info['clicked_gray']}"
+            ),
+            (
+                "refined: "
+                f"location=(z={last_click_info['refined_z']}, "
+                f"row={last_click_info['refined_y']}, "
+                f"col={last_click_info['refined_x']}), "
+                f"gray={last_click_info['refined_gray']}"
+            ),
+        ]
+    for line_index, line in enumerate(info_lines):
+        cv2.putText(
+            canvas,
+            line,
+            (24, info_y + 68 + line_index * 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
     return canvas
 
 
@@ -969,7 +1089,7 @@ def _apply_zoom(img: NDArray[np.uint8]) -> NDArray[np.uint8]:
 
 
 def _overlay_roi(img: NDArray[np.uint8]) -> NDArray[np.uint8]:
-    """Apply zoom, convert to BGR, then draw the ROI rectangle."""
+    """Apply zoom, convert to BGR, then draw the ROI or singleton point."""
     zoomed = _apply_zoom(img)
     out = cast(
         NDArray[np.uint8],
@@ -988,13 +1108,22 @@ def _overlay_roi(img: NDArray[np.uint8]) -> NDArray[np.uint8]:
     y1_disp = (y1_img * h / img_h - vy1) * h / crop_h
     x2_disp = (x2_img * w / img_w - vx1) * w / crop_w
     y2_disp = (y2_img * h / img_h - vy1) * h / crop_h
-    cv2.rectangle(
-        out,
-        (int(x1_disp), int(y1_disp)),
-        (int(x2_disp), int(y2_disp)),
-        (0, 255, 0),
-        2,
-    )
+    if x1_img == x2_img and y1_img == y2_img:
+        cv2.circle(
+            out,
+            (int(round(x1_disp)), int(round(y1_disp))),
+            4,
+            (0, 255, 0),
+            -1,
+        )
+    else:
+        cv2.rectangle(
+            out,
+            (int(x1_disp), int(y1_disp)),
+            (int(x2_disp), int(y2_disp)),
+            (0, 255, 0),
+            2,
+        )
     return out
 
 
@@ -1028,7 +1157,7 @@ def _redraw_images() -> None:
     gray_level = global_data.vol[z, cy, cx]
     sub_label = (
         f"[z={z}, {z * global_data.voxel_size_mm:.2f}mm]"
-        f"  center=({cx}, {cy}), gray_level={gray_level}{roi_suffix}"
+        f"  center=({cy}, {cx}), gray_level={gray_level}{roi_suffix}"
     )
     if global_data.display_slice.size:
         cv2.setWindowTitle(WIN_SLICE, f"Slice {sub_label}")
@@ -1040,10 +1169,14 @@ def _redraw_images() -> None:
         cv2.setWindowTitle(WIN_ENH, f"Enhanced  {sub_label}")
         cv2.imshow(WIN_ENH, _overlay_roi(global_data.display_enh))
     if cv2.getWindowProperty(WIN_STATS, cv2.WND_PROP_VISIBLE) >= 0:
-        cv2.setWindowTitle(WIN_STATS, f"Noise Statistics  {sub_label}")
+        cv2.setWindowTitle(WIN_STATS, f"Info  {sub_label}")
+        cv2.imshow(
+            WIN_STATS,
+            render_noise_stats(global_data.slice_stats, global_data.global_stats),
+        )
 
 
-def on_mouse_doubleclick(
+def on_mouse_singleclick(
     *,
     event: int,
     display_x: int,
@@ -1054,14 +1187,15 @@ def on_mouse_doubleclick(
     window_name: str,
     z: int,
 ) -> None:
-    """Handle a left-button double-click in one of the image windows.
+    """Handle a stationary left-button click in one of the image windows.
 
-    The clicked ``(y, x)`` coordinate is refined to the lateral location of the
-    maximum raw-volume value in the surrounding 3 × 3 × 3 neighborhood. The
-    displayed z-slice is not changed.
+    The clicked ``(y, x)`` coordinate is refined to the location of the maximum
+    raw-volume value in the surrounding 3 × 3 × 3 neighborhood. The refined
+    ``(z, y, x)`` is stored as a pending selection and is written only after
+    the user presses ``r``. The displayed z-slice is not changed.
 
     Args:
-        event: OpenCV mouse event code (``cv2.EVENT_LBUTTONDBLCLK``).
+        event: OpenCV mouse event code.
         display_x: Horizontal click coordinate in the displayed window.
         display_y: Vertical click coordinate in the displayed window.
         image_x: Horizontal coordinate mapped into the source image.
@@ -1070,10 +1204,26 @@ def on_mouse_doubleclick(
         window_name: Name of the OpenCV window that received the click.
         z: Volume slice displayed when the click occurred.
     """
+    global pending_particle_z_max, pending_particle_y, pending_particle_x
+    global last_click_info
+
+    if global_data.vol is None:
+        raise RuntimeError("Volume data is not loaded.")
+
     clicked_x, clicked_y = image_x, image_y
-    z1, z2 = max(0, z - 1), min(global_data.vol.shape[0], z + 2)
-    y1, y2 = max(0, image_y - 1), min(global_data.vol.shape[1], image_y + 2)
-    x1, x2 = max(0, image_x - 1), min(global_data.vol.shape[2], image_x + 2)
+    search_window = (3, 3, 3)
+    z1, z2 = (
+        max(0, z - search_window[0] // 2),
+        min(global_data.vol.shape[0], z + search_window[0] // 2 + 1),
+    )
+    y1, y2 = (
+        max(0, image_y - search_window[1] // 2),
+        min(global_data.vol.shape[1], image_y + search_window[1] // 2 + 1),
+    )
+    x1, x2 = (
+        max(0, image_x - search_window[2] // 2),
+        min(global_data.vol.shape[2], image_x + search_window[2] // 2 + 1),
+    )
 
     neighborhood = global_data.vol[z1:z2, y1:y2, x1:x2]
     local_z, local_y, local_x = np.unravel_index(
@@ -1083,16 +1233,31 @@ def on_mouse_doubleclick(
     image_y = y1 + int(local_y)
     image_x = x1 + int(local_x)
 
-    global_data.zoom_cx = image_x / global_data.vol.shape[2]
-    global_data.zoom_cy = image_y / global_data.vol.shape[1]
-    gray_level = global_data.vol[z, image_y, image_x]
+    # Keep the refined local maximum pending for confirmation with ``r``.
+    pending_particle_z_max = max_z
+    pending_particle_y = image_y
+    pending_particle_x = image_x
+
+    # The visual marker follows the exact location clicked by the user. It is
+    # intentionally separate from the refined location stored above.
+    global_data.roi = (clicked_x, clicked_y, clicked_x, clicked_y)
+
+    global_data.zoom_cx = clicked_x / global_data.vol.shape[2]
+    global_data.zoom_cy = clicked_y / global_data.vol.shape[1]
+    clicked_gray_level = global_data.vol[z, clicked_y, clicked_x]
     max_gray_level = global_data.vol[max_z, image_y, image_x]
-    print(
-        f"Double-click at display=({display_x}, {display_y}), "
-        f"clicked_image=({clicked_x}, {clicked_y}), "
-        f"refined_image=({image_x}, {image_y}), z={z}, max_z={max_z}, "
-        f"gray_level={gray_level}, max_gray_level={max_gray_level}"
-    )
+    last_click_info = {
+        "display_x": display_x,
+        "display_y": display_y,
+        "clicked_z": z,
+        "clicked_x": clicked_x,
+        "clicked_y": clicked_y,
+        "clicked_gray": int(clicked_gray_level),
+        "refined_z": max_z,
+        "refined_x": image_x,
+        "refined_y": image_y,
+        "refined_gray": int(max_gray_level),
+    }
     _redraw_images()
 
 
@@ -1100,52 +1265,9 @@ def _make_mouse_callback():
     """Return a single mouse callback shared across all 3 image windows.
 
     Left-drag       : draw ROI rectangle (shown on all windows live).
-    Left-doubleclick: call ``on_mouse_doubleclick`` with mapped coordinates.
+    Stationary left-click: call ``on_mouse_singleclick`` with mapped coordinates.
     Right-click     : set zoom center.
     """
-
-    def _dispatch_doubleclick(
-        event: int,
-        x: int,
-        y: int,
-        ix: int,
-        iy: int,
-        flags: int,
-        window_name: str,
-    ) -> None:
-        """Dispatch one double-click and suppress duplicate native events."""
-        now = monotonic()
-        recently_dispatched = (
-            now - _double_click["last_dispatch_time"] < 0.1
-            and window_name == _double_click["last_dispatch_win"]
-            and abs(x - _double_click["last_dispatch_x"])
-            <= _DOUBLE_CLICK_MAX_DISTANCE_PX
-            and abs(y - _double_click["last_dispatch_y"])
-            <= _DOUBLE_CLICK_MAX_DISTANCE_PX
-        )
-        if recently_dispatched:
-            return
-
-        _double_click["last_dispatch_time"] = now
-        _double_click["last_dispatch_x"] = x
-        _double_click["last_dispatch_y"] = y
-        _double_click["last_dispatch_win"] = window_name
-        _double_click["last_down_time"] = float("-inf")
-
-        # A double-click may arrive while the first click's drag state is still
-        # active. Clear it so the gesture cannot leave behind a stale ROI drag.
-        _drag["active"] = False
-        _drag["win"] = None
-        on_mouse_doubleclick(
-            event=event,
-            display_x=x,
-            display_y=y,
-            image_x=ix,
-            image_y=iy,
-            flags=flags,
-            window_name=window_name,
-            z=global_data.z_current,
-        )
 
     def _cb(event: int, x: int, y: int, flags: int, param) -> None:
         if not global_data.display_slice.size:
@@ -1162,37 +1284,31 @@ def _make_mouse_callback():
         ix = max(0, min(img_w - 1, ix))
         iy = max(0, min(img_h - 1, iy))
 
-        if event == cv2.EVENT_LBUTTONDBLCLK:
-            _dispatch_doubleclick(event, x, y, ix, iy, flags, str(param))
-        elif event == cv2.EVENT_LBUTTONDOWN:
-            now = monotonic()
-            is_fallback_doubleclick = (
-                now - _double_click["last_down_time"] <= _DOUBLE_CLICK_MAX_SECONDS
-                and param == _double_click["last_down_win"]
-                and abs(x - _double_click["last_down_x"])
-                <= _DOUBLE_CLICK_MAX_DISTANCE_PX
-                and abs(y - _double_click["last_down_y"])
-                <= _DOUBLE_CLICK_MAX_DISTANCE_PX
-            )
-            _double_click["last_down_time"] = now
-            _double_click["last_down_x"] = x
-            _double_click["last_down_y"] = y
-            _double_click["last_down_win"] = param
-
-            if is_fallback_doubleclick:
-                _dispatch_doubleclick(
-                    cv2.EVENT_LBUTTONDBLCLK, x, y, ix, iy, flags, str(param)
-                )
-            else:
-                _drag["active"] = True
-                _drag["sx"] = ix
-                _drag["sy"] = iy
-                _drag["win"] = param  # remember which window started the drag
+        if event == cv2.EVENT_LBUTTONDOWN:
+            _drag["active"] = True
+            _drag["sx"] = ix
+            _drag["sy"] = iy
+            _drag["win"] = param  # remember which window started the drag
         elif event == cv2.EVENT_LBUTTONUP:
             if not _drag["active"]:
                 return
+            is_stationary_click = (
+                abs(ix - _drag["sx"]) <= 4 and abs(iy - _drag["sy"]) <= 4
+            )
             _drag["active"] = False
             _drag["win"] = None
+            if is_stationary_click:
+                on_mouse_singleclick(
+                    event=event,
+                    display_x=x,
+                    display_y=y,
+                    image_x=ix,
+                    image_y=iy,
+                    flags=flags,
+                    window_name=str(param),
+                    z=global_data.z_current,
+                )
+                return
             roi = (
                 min(_drag["sx"], ix),
                 min(_drag["sy"], iy),
@@ -1264,7 +1380,9 @@ app = typer.Typer()
 
 
 def _init_globals(vol_index: int) -> None:
-    global global_data
+    global global_data, last_click_info
+    _clear_pending_particle()
+    last_click_info = None
     global_data = GlobalData(vol_index=vol_index)
     if global_data.vol is None:
         raise ValueError("Failed to load volume data")
@@ -1355,6 +1473,9 @@ def _run_main(
         new_z = pos + global_data.z_min
         state["z"] = new_z
 
+        if new_z != global_data.z_current:
+            _clear_pending_particle()
+
         # Update the global slice location which updates the slice stats.
         global_data.update_slice_location(new_z)
 
@@ -1430,6 +1551,7 @@ def _run_main(
             global_data.zoom_scale = 1.0
             _redraw_images()
         elif key in (ord("r"), ord("R")):
+            _record_pending_particle()
             global_data.roi = None
             _redraw_images()
 
